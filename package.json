@@ -1,0 +1,36 @@
+{
+  "name": "taudplay",
+  "version": "2.44.0",
+  "description": "Plays .taud tracker songs in the browser and in Node. One fader per voice, two probes per voice, no editor.",
+  "type": "module",
+  "main": "./src/taudplay/index.js",
+  "exports": {
+    ".": "./src/taudplay/index.js"
+  },
+  "files": [
+    "src",
+    "COPYING",
+    "README.md"
+  ],
+  "license": "LGPL-3.0-or-later",
+  "author": "CuriousTorvald",
+  "keywords": [
+    "taud",
+    "tracker",
+    "microtone",
+    "audio",
+    "webaudio",
+    "chiptune",
+    "module"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/curioustorvald/microtone-taudplay"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test"
+  }
+}
