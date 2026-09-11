@@ -16,6 +16,9 @@ fader per voice**, and **two probes per voice**:
 | **Probe** | `getVoiceVolume(voice)` — how loud that channel is right now, 0…1 |
 | **Probe** | `getVoicePan(voice)` — where it sits, 0 (left) … 0.5 … 1 (right) |
 
+…plus **interrupts**: sixteen events the *song itself* fires, in time with the
+music (`setInterrupt(n, fn)`).
+
 That is the point. A game does not want a pattern editor; it wants to duck the
 lead when the player enters a cave, bring the drums up in combat, and draw a
 little dancing meter on the pause screen. A tracker song is 32 or 64
@@ -59,6 +62,27 @@ The fade is applied inside the audio worklet, once per rendered block (every
 2.7 ms at 48 kHz), so a slow fade is smooth without your game loop driving it.
 A voice's NNA ghosts and metainstrument layer children follow its fader, so a
 faded channel really does take everything it spawned with it.
+
+### Let the song call you
+
+A song can fire sixteen **interrupts** — `Int0`…`IntF`, written in a note
+column, making no sound and disturbing no channel. Each carries a number the
+composer chose (0…65535). That is the song telling your program something, on
+the beat, without your program having to guess where the beat is.
+
+```js
+player.setInterrupt(0, (arg) => flashLight(arg));        // arg = which lamp
+player.setInterrupt(1, () => spawnEnemyWave());
+player.setInterrupt(2, (arg) => showSubtitle(lines[arg]));
+```
+
+Callbacks run on the main thread, from the same ~16 ms snapshot the probes ride
+on, so they can touch the DOM, your renderer, anything. `setInterrupt(n, null)`
+unregisters one; `clearInterrupts()` drops the lot. If the same interrupt fires
+twice inside one snapshot window you are called once, with the later argument.
+
+`TaudRenderer` has the same call, dispatched per rendered block — which is how
+you bounce a song and get its cue list out at the same time.
 
 ### Watch it
 
@@ -116,13 +140,14 @@ let pcm = r.render(30, (rr, frame) => {
 - `setBinaural(on)` — head-model monitoring for surround songs
 - `setVoiceGain(v, gain, fadeMs)`, `getVoiceGain(v)`
 - `getVoiceVolume(v)`, `getVoicePan(v)`
+- `setInterrupt(n, fn)`, `clearInterrupts()` — the song's own 16 events
 - `playing`, `cue`, `row`, `bpm`, `speed`, `channelCount`
 - `onSnapshot`, `onLoaded` callbacks
 
 ### `TaudRenderer` (anywhere)
 
-The same knob, probes and transport, plus `renderChunk()`, `render(seconds,
-onChunk)` and `toWav(seconds, { sampleRate })`.
+The same knob, probes, interrupts and transport, plus `renderChunk()`,
+`render(seconds, onChunk)` and `toWav(seconds, { sampleRate })`.
 
 ## What is *not* here
 
@@ -143,10 +168,9 @@ pattern) carry no song and are rejected.
 
 ## Licence
 
-Copyright (C) 2026 CuriousTorvald.
-
-LGPL-3.0-or-later — see `COPYING`. You may link this library into a
-proprietary application; changes *to the library itself* must be shared.
+LGPL-3.0-or-later — see `COPYING.LESSER` (and `COPYING` for the GPL text it
+builds on). You may link this library into a proprietary application; changes
+*to the library itself* must be shared.
 
 The vendored decompressors keep their own (MIT) licences:
 [fflate](https://github.com/101arrowz/fflate) and
@@ -155,7 +179,7 @@ The vendored decompressors keep their own (MIT) licences:
 
 ---
 
-Generated from Microtone.js 2.44.0 (engine 9f8917cdf676) by
+Generated from Microtone.js 2.48.0 (engine 14d8b4fbb1d2) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.
