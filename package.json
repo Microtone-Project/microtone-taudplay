@@ -10,6 +10,7 @@
   "files": [
     "src",
     "COPYING",
+    "COPYING.LESSER",
     "README.md"
   ],
   "license": "LGPL-3.0-or-later",
