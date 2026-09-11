@@ -1,6 +1,6 @@
 {
   "name": "taudplay",
-  "version": "2.48.0",
+  "version": "2.48.2",
   "description": "Plays .taud tracker songs in the browser and in Node. One fader per voice, two probes per voice, no editor.",
   "type": "module",
   "main": "./src/taudplay/index.js",
