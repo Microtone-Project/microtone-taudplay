@@ -13,6 +13,7 @@ import {
 } from "./tables.js";
 import { computePlaybackRate, startFastFade, startCutRamp } from "./sampler.js";
 import { refreshVoiceFilter } from "./filter.js";
+import { isSoundingChild } from "./voice.js";
 import {
   advanceEnvelope, advancePitchEnvelope, advanceFilterEnvelope,
   advanceAutoVibrato, applyKeyLift, forceKeyLift, seedPfRole, pfIdxBox, pfTimeBox,
@@ -250,6 +251,15 @@ export function applyTrackerTick(eng, ts, playhead) {
         case 4: // Key lift — forced, bypasses the instrument's own flag.
           voice.keyOff = true;
           forceKeyLift(voice);
+          // …and it bypasses it for the WHOLE note, exactly as the note cut
+          // above reaches every child: a metainstrument is one note, so a
+          // forced lift written on its channel has to lift all of it. The
+          // per-tick sync cannot do this one — it hands each child its own
+          // instrument's applyKeyLift, which is the flag this command exists
+          // to override (item 191.3).
+          for (const bg of ts.backgroundVoices) {
+            if (isSoundingChild(ts, bg, vi)) { bg.keyOff = true; forceKeyLift(bg); }
+          }
           break;
       }
       voice.noteActionTick = -1;
@@ -421,7 +431,7 @@ export function applyTrackerTick(eng, ts, playhead) {
         voice.retrigCounter = 0;
         restartVoice(voice);
         for (const bg of ts.backgroundVoices) {
-          if (bg.isLayerChild && bg.sourceChannel === vi) restartVoice(bg);
+          if (isSoundingChild(ts, bg, vi)) restartVoice(bg);
         }
         voice.noteVolume = applyRetrigVolMod(voice.noteVolume, voice.retrigVolMod, ts.volStep, ts.volMax);
         voice.rowVolume = voice.noteVolume;
@@ -565,8 +575,13 @@ export function applyTrackerTick(eng, ts, playhead) {
     if (!bg.active) { ts.backgroundVoices.splice(i, 1); continue; }
     // Layer child: re-sync pitch / key-off / volume / pan from the parent each tick.
     if (bg.isLayerChild) {
-      const parent = bg.sourceChannel >= 0 && bg.sourceChannel < ts.voices.length
-        ? ts.voices[bg.sourceChannel] : null;
+      // An operand follows the voice that READS it, which for a rack the NNA
+      // has already ghosted (item 191) is a background voice and not the
+      // channel's. Every other child follows the channel, as it always has.
+      const parent = bg.fmOperator
+        ? bg.fmParent
+        : (bg.sourceChannel >= 0 && bg.sourceChannel < ts.voices.length
+          ? ts.voices[bg.sourceChannel] : null);
       // An FM operator outlives its rack for no one: nothing reads it once the
       // rack is gone, and the mixer never summed it, so a detached operator
       // would be an inaudible voice ageing forever. It dies with the note.
@@ -574,6 +589,7 @@ export function applyTrackerTick(eng, ts, playhead) {
           parent.fmRig === null || parent.fmRig.voices[0] !== parent)) {
         bg.active = false;
         bg.fmOperator = false;
+        bg.fmParent = null;
         ts.backgroundVoices.splice(i, 1);
         continue;
       }
