@@ -293,7 +293,7 @@ function armFunkXfade(voice, offset, windowLen) {
 
 /** Same seam crossfade as `armFunkXfade`, on extended $102/$12x's own
  *  independent window (`voice.modFunkWindow`/`modFunkXfade*`) — a separate
- *  ghost channel because the two commands "do not share state"
+ *  set of ghost state because the two commands "do not share state"
  *  (TAUD_NOTE_EFFECTS.md) and can be live on one voice at once. */
 function armModFunkXfade(voice, offset, windowLen) {
   if (offset === 0) return;
@@ -497,7 +497,7 @@ function advanceSamplePos(voice, inst, sampleLen) {
           if (extWindowed) {
             // The restart is where the walk's pointer has got to by now, and
             // the seam it opens is crossfaded (item 163.2), on this command's
-            // OWN ghost channel.
+            // OWN ghost state.
             const prevWindow = extLoopStart;
             if (inst.modFunkPos >= 0) voice.modFunkWindow = inst.modFunkPos;
             armModFunkXfade(voice, prevWindow - voice.modFunkWindow, loopEnd - loopStart);
@@ -625,7 +625,7 @@ function pitchGlideSamples(cur, target, spt) {
 /**
  * Per-sample pitch glide toward the tick's playbackRate, so the control signal
  * is INTERPOLATED rather than stepped. A fresh trigger snaps: a new note starts
- * at its own pitch, it does not bend up from whatever the channel was last
+ * at its own pitch, it does not bend up from whatever the lane was last
  * playing.
  */
 export function advancePitchRamp(voice, spt) {

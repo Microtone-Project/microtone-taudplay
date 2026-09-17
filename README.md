@@ -8,12 +8,13 @@ for note and sample for sample: a file rendered here is bit-identical to the
 same file rendered in the tracker.
 
 What it exposes is deliberately small — the whole API is a transport, **one
-fader per voice**, and **two probes per voice**:
+fader per lane**, and **two probes per lane** (the API spells a lane
+`voice` — that is the engine's own name for the slot a lane plays on):
 
 | | |
 |---|---|
 | **Knob** | `setVoiceGain(voice, gain, fadeMs)` — 1 = as written, 0 = silent |
-| **Probe** | `getVoiceVolume(voice)` — how loud that channel is right now, 0…1 |
+| **Probe** | `getVoiceVolume(voice)` — how loud that lane is right now, 0…1 |
 | **Probe** | `getVoicePan(voice)` — where it sits, 0 (left) … 0.5 … 1 (right) |
 
 …plus **interrupts**: sixteen events the *song itself* fires, in time with the
@@ -22,7 +23,7 @@ music (`setInterrupt(n, fn)`).
 That is the point. A game does not want a pattern editor; it wants to duck the
 lead when the player enters a cave, bring the drums up in combat, and draw a
 little dancing meter on the pause screen. A tracker song is 32 or 64
-independent channels of music that were *written together* — fading them
+independent lanes of music that were *written together* — fading them
 against each other gives you contextual scoring for the cost of one file.
 
 ## Install
@@ -49,7 +50,7 @@ button.onclick = async () => { await player.resume(); player.play(); };
 ### Mix it
 
 ```js
-player.setVoiceGain(4, 0.0, 1200);   // fade channel 5 out over 1.2 s
+player.setVoiceGain(4, 0.0, 1200);   // fade lane 5 out over 1.2 s
 player.setVoiceGain(4, 1.0, 400);    // …and back in, faster
 
 // Duck everything but the drums.
@@ -116,7 +117,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import { TaudRenderer } from "taudplay";
 
 const r = new TaudRenderer(await readFile("theme.taud"));
-r.setVoiceGain(4, 0);                      // bounce the song without channel 5
+r.setVoiceGain(4, 0);                      // bounce the song without lane 5
 await writeFile("theme.wav", r.toWav(120));
 ```
 
@@ -162,7 +163,7 @@ play, free and in your browser at [microtone.cc](https://microtone.cc).
 
 ## Format support
 
-Full `.taud` files, any format version the engine reads, 32- or 64-channel,
+Full `.taud` files, any format version the engine reads, 32- or 64-lane,
 stereo or surround. `.tsii` (samples and instruments) and `.tpif` (a single
 pattern) carry no song and are rejected.
 
@@ -179,7 +180,7 @@ The vendored decompressors keep their own (MIT) licences:
 
 ---
 
-Generated from Microtone.js 2.55.5 (engine 1c3ac1d8b5c6) by
+Generated from Microtone.js 2.59.1 (engine 88ac7f59d8b8) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.
