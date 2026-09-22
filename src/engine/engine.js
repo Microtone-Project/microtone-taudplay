@@ -20,7 +20,9 @@ import { tuningRatioOf } from "./tables.js";
 import { TaudInst, parsePatchesBlob, writePatchesBlob, makeInstPatch, layerNote } from "./inst.js";
 import { PlayCue, TaudPlayData, Playhead } from "./state.js";
 import { makeXorshift32 } from "./rng.js";
-import { SURROUND_STEREO, foldAzimuthToPan, voiceAzimuth, voiceElevation } from "./spatial.js";
+import {
+  SURROUND_STEREO, SURROUND_SPATIAL, foldAzimuthToPan, voiceAzimuth, voiceElevation,
+} from "./spatial.js";
 import { generateTrackerAudio } from "./mixer.js";
 import { triggerMetaOrNote, triggerNote } from "./trigger.js";
 import { startCutRamp } from "./sampler.js";
@@ -299,6 +301,8 @@ export class TaudEngine {
       // resetParams (state.js).
       v.channelVolume = ts.volMax;
       v.channelPan = 0x80;
+      v.channelVolumeSet = false;
+      v.channelPanSet = false;
       v.rowPan = 32;
       v.panAzimuth = 128.0;
       v.panElevation = 0.0;
@@ -634,6 +638,35 @@ export class TaudEngine {
   }
 
   getVoiceActive(ph, vi) { return this._voice(ph, vi).active; }
+
+  /**
+   * The LANE axis as the pattern left it (item 198.3): `channel_vol`, and the
+   * lane position `S $8aaa` / `X $eeaa` share. Deliberately NOT gated on
+   * `active` — the two registers belong to the lane and survive between notes,
+   * which is the whole reason a display wants them; the effective readings
+   * above answer the other question, "where did the sounding note end up".
+   */
+  getVoiceChannelVolume(ph, vi) { return this._voice(ph, vi).channelVolume; }
+  /** `S $8aaa`'s `aaa`: the pan byte in a stereo song, the 512-unit azimuth otherwise. */
+  getVoiceChannelAzimuth(ph, vi) {
+    const v = this._voice(ph, vi);
+    return this.playheads[ph].surroundModel === SURROUND_STEREO ? v.channelPan : v.panAzimuth;
+  }
+  /** `X $eeaa`'s `ee` — signed, 128 units = 90°; zero unless the song is spatial. */
+  getVoiceChannelElevation(ph, vi) {
+    const v = this._voice(ph, vi);
+    return this.playheads[ph].surroundModel === SURROUND_SPATIAL ? v.panElevation : 0.0;
+  }
+
+  /**
+   * Has the song STATED either lane axis, as opposed to leaving it where a
+   * reset put it? A different question from "is it at its default value":
+   * `M $3F00` and `S $8080` write exactly the values a reset leaves behind,
+   * and they are statements, not absences. Only a command that writes the
+   * register raises these; only a reset clears them.
+   */
+  getVoiceChannelVolumeSet(ph, vi) { return this._voice(ph, vi).channelVolumeSet; }
+  getVoiceChannelPanSet(ph, vi) { return this._voice(ph, vi).channelPanSet; }
 
   /**
    * Fill the per-voice soundscope rings (`Voice.scopeBuffer`) or not. Off by
