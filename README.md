@@ -32,7 +32,7 @@ against each other gives you contextual scoring for the cost of one file.
 npm install taudplay
 ```
 
-…or just copy `src/` in. There is no build step and no dependency to install:
+…or just copy `src/` and `core/` in. There is no build step and no dependency to install:
 everything is ES modules, and the two vendored decompressors are single files.
 
 ## Play something
@@ -176,11 +176,11 @@ builds on). You may link this library into a proprietary application; changes
 The vendored decompressors keep their own (MIT) licences:
 [fflate](https://github.com/101arrowz/fflate) and
 [fzstd](https://github.com/101arrowz/fzstd). The binaural filter set in
-`src/engine/hrir-sadie.js` is the GoogleVR/SADIE set, Apache-2.0.
+`core/engine/hrir-sadie.js` is the GoogleVR/SADIE set, Apache-2.0.
 
 ---
 
-Generated from Microtone.js 3.3.1 (engine c3ec8117014a) by
+Generated from Microtone.js 3.5.0 (engine 8f03c8cd6d2d) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.
