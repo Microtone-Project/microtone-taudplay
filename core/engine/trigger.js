@@ -7,13 +7,15 @@
 
 import { MAX_BG_VOICES, ATTACK_RAMP_SAMPLES } from "./constants.js";
 import { Voice, isSoundingChild } from "./voice.js";
-import { patchIsStereo, patchVibratoInherits, layerNote } from "./inst.js";
+import { patchIsStereo, patchVibratoInherits, layerNote, DCT_LANE } from "./inst.js";
 import {
   FmRig, cloneFmRig, fmReferencedOperators, fmSeedGains, dropFmOperators,
 } from "./fm.js";
 import { META_MIX_GAIN, attenGainOf, EffectOp, clamp } from "./tables.js";
 import { envPresent, envCarry, applyKeyLift, seedPfRole, pfIdxBox, pfTimeBox } from "./envelope.js";
 import { computePlaybackRate, startCutRamp } from "./sampler.js";
+import { OplState, oplKeyOn, cloneOplState, OPL_C4_RATE } from "./opl.js";
+import { FormantState, formantNoteOn, cloneFormantState, PHASE_CODA } from "./formant.js";
 import { random } from "./rng.js";
 import {
   applyPanSet, applyPanSlide, applyElevation, SURROUND_STEREO, SURROUND_SPATIAL,
@@ -47,7 +49,10 @@ export function applyActiveSample(voice, inst, patch) {
     voice.activeSamplePlayStart = inst.samplePlayStart;
     voice.activeSampleLoopStart = inst.sampleLoopStart;
     voice.activeSampleLoopEnd = inst.sampleLoopEnd;
-    voice.activeSamplingRate = inst.samplingRate;
+    // An OPL instrument's rate is its C2SPD, and a record that leaves it 0 plays at
+    // the tracker convention (§7.7) — the pitch has to come from somewhere.
+    voice.activeSamplingRate = inst.opl !== null && inst.samplingRate === 0
+      ? OPL_C4_RATE : inst.samplingRate;
     voice.activeSampleDetune = inst.sampleDetuneSigned;
     voice.activeLoopMode = inst.loopMode;
     voice.activeVibratoSpeed = inst.vibratoSpeed;
@@ -420,6 +425,9 @@ function triggerFmRack(eng, ts, voice, vi, noteVal, inst, rowVolOverride, seedVo
   const program = inst.fmProgram;
   const sounds = (o) =>
     o.instIdx >= 1 && o.instIdx <= 1023 && !eng.instruments[o.instIdx].isMeta &&
+    // An OPL instrument is a channel, not a waveform a rack can read (§7.7);
+    // a formant instrument is a sound made of a waveform, not one (§7.8).
+    !eng.instruments[o.instIdx].isOpl && !eng.instruments[o.instIdx].isFormant &&
     noteVal >= o.pitchStart && noteVal <= o.pitchEnd &&
     seedVol >= o.volStart && seedVol <= o.volEnd;
   // No algorithm, or no principal operator, is silence — the same answer the
@@ -523,6 +531,11 @@ export function triggerNote(eng, ts, voice, noteVal, instId, volOverride) {
   // below once the patch has said which envelopes are active.
   const mayCarry = voice.active && !voice.keyOff && !voice.noteFading
     && (instId === 0 || instId === voice.instrumentId);
+  // An OPL channel handed over by maybeSpawnBackgroundForNNA (a retrigger the
+  // New Note Action cuts) keeps its envelopes, as the chip does — read before
+  // anything below marks the voice active.
+  const oplCarry = voice.oplCarry && voice.active && voice.opl !== null;
+  voice.oplCarry = false;
   if (instId !== 0) voice.instrumentId = instId;
   const inst = eng.instruments[voice.instrumentId];
   // Resolve the Ixmp patch for this trigger (volume axis = pre-patch seed).
@@ -531,6 +544,9 @@ export function triggerNote(eng, ts, voice, noteVal, instId, volOverride) {
   if (volOverride >= 0) seedVolForLookup = narrow(volOverride);
   else if (instId !== 0) seedVolForLookup = rowVolumeFromDefault(inst, null);
   else seedVolForLookup = narrow(voice.noteVolume);
+  // An OPL instrument has no keyboard map: its sound is its one patch (§7.7);
+  // nor has a formant instrument: its sample is the one glottal source (§7.8).
+  // resolvePatch answers null for both.
   const patch = inst.resolvePatch(noteVal, seedVolForLookup);
   applyActiveSample(voice, inst, patch);
   voice.tonePortaTarget = -1; // fresh note trigger cancels any running porta
@@ -578,7 +594,10 @@ export function triggerNote(eng, ts, voice, noteVal, instId, volOverride) {
   voice.rampOutSamples = 0;
   voice.rampOutGain = 0.0;
   // Arm the Attack fade-in (item 139); see constants.js ATTACK_RAMP_SAMPLES.
-  voice.attackRampSamples = ATTACK_RAMP_SAMPLES;
+  // Not on an OPL voice: its attack IS the chip's envelope, which starts from
+  // silence on a fresh channel and from where it stood on a carried one — a
+  // fade on top would soften every attack-rate-15 patch the chip plays hard.
+  voice.attackRampSamples = inst.opl !== null ? 0 : ATTACK_RAMP_SAMPLES;
   voice.autoVibPhase = 0;
   voice.autoVibTicksSinceTrigger = 0;
   voice.nesDpcmCounter = 63;
@@ -711,6 +730,22 @@ export function triggerNote(eng, ts, voice, noteVal, instId, volOverride) {
   // including the ones that never go through triggerMetaOrNote (the audition
   // path, a layer child). triggerFmRack re-hangs it after this returns.
   voice.fmRig = null;
+  // The OPL channel (item 209): keyed on here, carried or fresh. A voice
+  // object's previous OplState is reused — an NNA ghost took a copy of it.
+  if (inst.opl !== null) {
+    if (voice.opl === null) voice.opl = new OplState();
+    oplKeyOn(voice.opl, inst.opl, oplCarry);
+  } else {
+    voice.opl = null;
+  }
+  // A formant instrument (item 212): every trigger is a fresh syllable, onset
+  // and all. The voice object's previous state is reused — a ghost took a copy.
+  if (inst.formant !== null) {
+    if (voice.formant === null) voice.formant = new FormantState();
+    formantNoteOn(voice.formant, inst.formant);
+  } else {
+    voice.formant = null;
+  }
   if (voice.vibratoRetrig) voice.vibratoLfoPos = 0;
   if (voice.tremoloRetrig) voice.tremoloLfoPos = 0;
   if (voice.panbrelloRetrig) voice.panbrelloLfoPos = 0;
@@ -739,9 +774,25 @@ function principalOf(eng, instId, note) {
 
 /**
  * IT-style Duplicate Check (DCT/DCA), run BEFORE NNA on every fresh foreground
- * trigger. Reference: schismtracker effects.c:1664-1764.
+ * trigger. Reference: schismtracker effects.c csf_check_nna.
+ *
+ * Type 4, Lane (item 216), is Taud's own: every note arriving on the lane is
+ * a duplicate, whatever plays it — a note with no instrument byte included,
+ * which plays the lane's current instrument. Types 1-3 still ask only about a
+ * note that names its instrument. (IT checks a bare note too, against the
+ * lane's instrument, and its Note Cut then leaves the bare note itself at
+ * volume 0 — measured with openmpt123; not followed here.)
+ *
+ * Formant instruments (item 212) read it as one voice speaking: their
+ * "sample" is the POOL RANGE they are made from, so DCT Sample matches any
+ * formant instrument made from the same range — the syllables of a word, each
+ * its own instrument. What it ends is the VOWEL: a formant voice already
+ * speaking its coda, or already ramping out, is no duplicate, and a cut is a
+ * crossfade (as NNA Note Cut's is) rather than a step.
  */
 export function applyDuplicateCheck(eng, ts, channel, instId, note) {
+  const bare = instId === 0;
+  if (bare) instId = ts.voices[channel].instrumentId;
   if (instId === 0) return;
   const [newInstId, newNote] = principalOf(eng, instId, note);
   const newInst = eng.instruments[newInstId];
@@ -751,20 +802,36 @@ export function applyDuplicateCheck(eng, ts, channel, instId, note) {
 
   const isDuplicate = (v) => {
     const existInst = eng.instruments[v.instrumentId];
+    if (v.formant !== null && (v.formant.phase >= PHASE_CODA || v.rampOutSamples > 0)) return false;
+    if (bare && existInst.duplicateCheckType !== DCT_LANE) return false;
     switch (existInst.duplicateCheckType) {
       case 1: return v.noteVal === newNote && v.instrumentId === newInstId;
-      case 2: return v.instrumentId === newInstId &&
-                     v.activeSamplePtr === newSmpPtr &&
-                     v.activeSampleLength === newSmpLen;
+      case 2:
+        if (v.formant !== null && existInst.formant !== null && newInst.formant !== null) {
+          return existInst.formant.rangeLo === newInst.formant.rangeLo &&
+                 existInst.formant.rangeHi === newInst.formant.rangeHi;
+        }
+        return v.instrumentId === newInstId &&
+               v.activeSamplePtr === newSmpPtr &&
+               v.activeSampleLength === newSmpLen;
       case 3: return v.instrumentId === newInstId;
+      case DCT_LANE: return true;
       default: return false;
     }
   };
 
-  const applyAction = (v) => {
+  const applyAction = (v, isFg) => {
     const existInst = eng.instruments[v.instrumentId];
     switch (existInst.duplicateCheckAction) {
-      case 0: v.fadeoutVolume = 0.0; v.active = false; break;
+      case 0:
+        if (v.formant !== null) {
+          // Ramped out over the incoming note's attack: the foreground voice
+          // through a ghost, since the note is about to reuse it.
+          startCutRamp(isFg ? ghostRig(ts, v, channel) : v);
+          if (isFg) { v.active = false; capBackgroundVoices(ts); }
+          break;
+        }
+        v.fadeoutVolume = 0.0; v.active = false; break;
       case 1: v.keyOff = true; applyKeyLift(v, existInst); break;
       case 2: v.noteFading = true; break;
     }
@@ -772,7 +839,7 @@ export function applyDuplicateCheck(eng, ts, channel, instId, note) {
 
   const fg = ts.voices[channel];
   if (fg.active && eng.instruments[fg.instrumentId].duplicateCheckType !== 0 && isDuplicate(fg)) {
-    applyAction(fg);
+    applyAction(fg, true);
   }
 
   for (let i = ts.backgroundVoices.length - 1; i >= 0; i--) {
@@ -785,7 +852,7 @@ export function applyDuplicateCheck(eng, ts, channel, instId, note) {
     if (bg.fmOperator) continue;
     if (eng.instruments[bg.instrumentId].duplicateCheckType === 0) continue;
     if (!isDuplicate(bg)) continue;
-    applyAction(bg);
+    applyAction(bg, false);
     if (!bg.active) ts.backgroundVoices.splice(i, 1);
   }
 }
@@ -845,11 +912,20 @@ function ghostRig(ts, voice, channel) {
  * already the note's (TAUD_ENGINE_SPEC §5.5.1), and whose New Note Action is
  * therefore the rack's.
  */
-export function maybeSpawnBackgroundForNNA(eng, ts, voice, channel) {
+export function maybeSpawnBackgroundForNNA(eng, ts, voice, channel, incomingInst = 0) {
   if (!voice.active) return;
   const nna = voice.nnaOverride >= 0
     ? voice.nnaOverride
     : eng.instruments[voice.instrumentId].newNoteAction;
+  if (nna === 1 && voice.opl !== null && voice.fmRig === null &&
+      eng.instruments[incomingInst !== 0 ? incomingInst : voice.instrumentId].isOpl) {
+    // An OPL note cut by an OPL note is not a crossfade but a retrigger of the
+    // same channel (§5.5.2): the chip keys the operators on again from
+    // wherever their envelopes stand, with no ghost and no ramp. triggerNote
+    // picks the hand-over up.
+    voice.oplCarry = true;
+    return;
+  }
   if (nna === 1) {
     // Note Cut. The voice is about to be REUSED for the new note, so "cut" used
     // to mean dropping the old one wherever its waveform happened to be — a step
@@ -1023,6 +1099,14 @@ export function ghostVoice(src, channel) {
   v.activeDefaultCutoff = src.activeDefaultCutoff;
   v.activeDefaultResonance = src.activeDefaultResonance;
   v.activeAttenGain = src.activeAttenGain;
+  // An OPL channel is the voice's whole sound and its whole state: the ghost
+  // takes a copy, clock and envelopes and all, and the lane keeps its own to
+  // re-key for the next note.
+  v.opl = src.opl !== null ? cloneOplState(src.opl) : null;
+  // The ghost of a voice sounding a formant instrument is the syllable it was
+  // saying: a released one goes
+  // on into its coda in the background (formant.js reads the ghost's key-off).
+  v.formant = src.formant !== null ? cloneFormantState(src.formant) : null;
   return v;
 }
 

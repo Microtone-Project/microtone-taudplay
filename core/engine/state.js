@@ -213,6 +213,10 @@ export class TrackerState {
     this.tickInRow = 0;
     this.samplesIntoTick = 0.0;
     this.firstRow = true;
+    // The OPL chip clock (item 209): output frames mixed since the last
+    // transport reset. Every OPL voice reads the chip's envelope counter and
+    // LFOs off it, so a playhead's OPL voices are one chip (engine/opl.js).
+    this.oplFrame = 0;
     // Always MAX_VOICES so 64-lane mode has slots for every lane, plus
     // the dedicated jam bank above them (JAM_VOICE_BASE…, item 140) — the tick
     // and mix loops run the whole array, the row loop only the lanes.
@@ -402,6 +406,42 @@ export class TrackerState {
    *  the matching drain returned — the words outlive the mask, so reading one
    *  for an interrupt that did not fire yields whatever fired last. */
   interruptArg(n) { return this.interruptArgs[n & (NUM_INTERRUPTS - 1)]; }
+
+  /**
+   * The per-PLAY half of every reset that starts playback somewhere (§15):
+   * the tick clock and the jump state, no voice sounding, the background pool
+   * empty, the interrupt latch clear, and the mastering chain's and the
+   * meter's running state gone. Lane state is not touched — setTrackerRow
+   * puts it back to the song's start, a chase (item 215) leaves it where the
+   * song left it. The row is the caller's.
+   */
+  resetPlayState() {
+    this.tickInRow = 0;
+    this.samplesIntoTick = 0.0;
+    this.firstRow = true;
+    // A replay meets the OPL chip where a render from the start does (§15).
+    this.oplFrame = 0;
+    this.pendingOrderJump = -1;
+    this.pendingRowJump = -1;
+    this.pendingRowJumpLocal = false;
+    this.patternDelayRemaining = 0;
+    this.patternDelayActive = false;
+    this.sexWinningChannel = -1;
+    this.finePatternDelayExtra = 0;
+    this.pendingInterrupts = 0;
+    this.interruptArgs.fill(0);
+    for (const v of this.voices) v.active = false;
+    this.backgroundVoices.length = 0; // drop lingering NNA ghosts from a prior play
+    // The mastering chain (item 178) is per-PLAY transient in exactly the sense
+    // the ghost pool is: a compressor still holding six decibels of reduction
+    // from before the seek, and a look-ahead buffer still holding two
+    // milliseconds of the previous playback, both bleed the old take into the
+    // new one. Its PARAMETERS are the song's and are left alone, like the tempo.
+    this.mastering?.reset();
+    // …and the meter's integration describes one playback, so it starts again
+    // with it — including the bit histogram, which is cumulative by design.
+    this.masterMeter?.resetAll();
+  }
 }
 
 // ── Playhead (4949-5207), tracker-mode-only port ──
@@ -527,6 +567,43 @@ export class Playhead {
     if (ts !== null) ts.cuePos = Math.min(pos, NUM_CUES - 1);
   }
 
+  /**
+   * Where a freshly loaded song starts — a chase's first step (item 215, §15.1).
+   * `start` carries the song's own tempo, tick rate and volumes: the engine
+   * has no song table, so they are the host's. Everything else a play may
+   * have moved goes back: the position and the per-play state, the tone and
+   * interpolation modes to the file's flags (`1 $xx00` writes them), the Amiga
+   * LED filter off and the post-mix filters' history empty, every LANE voice
+   * to power-on (Voice.resetToPowerOn — the desk's faders kept), and the
+   * per-instrument runtime state (invert masks, sample modifications, filter
+   * overrides) cleared. The jam bank, the tuning, the surround model and the
+   * mastering parameters are not the play's, and are left alone.
+   */
+  resetToSongStart(start) {
+    this.bpm = start.bpm;
+    this.tickRate = start.tickRate;
+    this.globalVolume = start.globalVolume;
+    this.mixingVolume = start.mixingVolume;
+    this.position = 0;
+    const ts = this.trackerState;
+    if (ts === null) return;
+    ts.cuePos = 0;
+    ts.rowIndex = 0;
+    ts.resetPlayState();
+    ts.toneMode = this.initialGlobalFlags & 3;
+    ts.interpolationMode = (this.initialGlobalFlags >>> 2) & 7;
+    ts.ledFilterOn = false;
+    ts.amigaLPStateL = 0.0; ts.amigaLPStateR = 0.0;
+    ts.amigaLEDStateL.fill(0.0); ts.amigaLEDStateR.fill(0.0);
+    for (let vi = 0; vi < JAM_VOICE_BASE; vi++) ts.voices[vi].resetToPowerOn(ts.volMax);
+    for (const inst of this.parent.instruments) {
+      inst.invertMask = null;
+      inst.resetMod();
+      inst.cutoffOverride = -1;
+      inst.resonanceOverride = -1;
+    }
+  }
+
   resetParams() {
     this.position = 0;
     this.isPlaying = false;
@@ -543,6 +620,7 @@ export class Playhead {
     ts.tuningRatio = 1.0;
     ts.cuePos = 0; ts.rowIndex = 0; ts.tickInRow = 0;
     ts.samplesIntoTick = 0.0; ts.firstRow = true;
+    ts.oplFrame = 0;
     ts.pendingOrderJump = -1; ts.pendingRowJump = -1;
     ts.pendingRowJumpLocal = false;
     ts.patternDelayRemaining = 0; ts.patternDelayActive = false;
@@ -630,6 +708,7 @@ export class Playhead {
       it.layerRelPan = 0; it.layerRelElevation = 0;
       it.layerPitchMod = 0; it.pitchModDelta = 0;
       it.fmRig = null; it.fmOperator = false; it.fmParent = null;
+      it.opl = null; it.oplCarry = false; it.formant = null;
       // "What's playing" state — cleared alongside the volume reset so a stale
       // instrumentId can't survive into a fresh session (AudioAdapter.kt:5130-5142).
       it.instrumentId = 0;

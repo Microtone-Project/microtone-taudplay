@@ -173,6 +173,22 @@ export class Voice {
     // that spawned them.
     this.fmParent = null;
 
+    // ── OPL channel (Metainstrument type 8, item 209) ──
+    // The sounding chip channel (engine/opl.js OplState) of a voice playing an
+    // OPL instrument, or null — which is what the mixer branches on. Kept on
+    // the voice across notes so a retrigger the New Note Action cuts can key
+    // the same channel on again, envelopes where they stand (`oplCarry` is
+    // that hand-over, set by maybeSpawnBackgroundForNNA for triggerNote).
+    this.opl = null;
+    this.oplCarry = false;
+
+    // ── Formant instrument (Metainstrument type 1, item 212) ──
+    // The tract this voice's sample is sounding through (engine/formant.js
+    // FormantState), or null — which is what the mixer branches on. Built at
+    // every trigger; an NNA ghost takes a copy, so a released syllable finishes
+    // its coda in the background while the lane starts the next one.
+    this.formant = null;
+
     // Two-axis volume AND pan model (TAUD_NOTE_EFFECTS.md §3). Both axes work
     // the same way on either side: the instrument seeds the NOTE axis and the
     // pattern's lane commands own the LANE axis, and the two combine at
@@ -548,7 +564,46 @@ export class Voice {
   get activeSampleLoopSustain() { return (this.activeLoopMode & 0x04) !== 0; }
   /** True when this voice renders a stereo pair (see activeChanCount). */
   get isStereo() { return this.activeChanCount === 2; }
+
+  /**
+   * Back to what the constructor makes — the lane as a freshly loaded song
+   * finds it, which is where a chase starts (item 215, TAUD_ENGINE_SPEC.md
+   * §15.1). Every field, not a chosen list of them: a chase that began from
+   * the effect memory, an LFO phase or a tremor counter the last play left
+   * behind would not arrive where a play from the start does. Kept: the
+   * host's fader (the desk's, not the song's) and the scope ring's storage.
+   * `volMax` is the cell format's full scale, which the three volume
+   * registers start at (TrackerState.setCellFormat).
+   */
+  resetToPowerOn(volMax) {
+    if (POWER_ON === null) {
+      POWER_ON = new Voice();
+      POWER_ON_SCALARS = Object.keys(POWER_ON).filter((k) => {
+        const x = POWER_ON[k];
+        return x === null || typeof x !== "object";
+      });
+    }
+    const fader = this.fader;
+    for (const k of POWER_ON_SCALARS) this[k] = POWER_ON[k];
+    this.fader = fader;
+    Object.assign(this.mem, POWER_ON.mem);
+    Object.assign(this.modGeom, POWER_ON.modGeom);
+    this.right.reset();
+    // Read-only views, as an instrument's own envelopes are when a trigger
+    // points these at them — nothing writes through them.
+    this.activeVolEnv = POWER_ON.activeVolEnv;
+    this.activePanEnv = POWER_ON.activePanEnv;
+    this.activePitchEnv = POWER_ON.activePitchEnv;
+    this.activeFilterEnv = POWER_ON.activeFilterEnv;
+    this.noteVolume = volMax;
+    this.channelVolume = volMax;
+    this.rowVolume = volMax;
+  }
 }
+
+/** The template resetToPowerOn copies from, and its non-object fields. */
+let POWER_ON = null;
+let POWER_ON_SCALARS = null;
 
 /**
  * Is background voice `bg` part of the note lane `vi` is sounding RIGHT NOW?

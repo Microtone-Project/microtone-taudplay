@@ -11,6 +11,8 @@ import {
 } from "./trigger.js";
 import { applyKeyLift, envPresent, envCarry, seedPfRole, pfIdxBox, pfTimeBox } from "./envelope.js";
 import { startFastFade, startCutRamp } from "./sampler.js";
+import { OplState, oplKeyOn, oplReattack } from "./opl.js";
+import { FormantState, formantRelatch, formantStartAtVowel } from "./formant.js";
 import { applyEffectRow } from "./effects.js";
 
 /**
@@ -194,7 +196,7 @@ export function applyTrackerRow(eng, ts, playhead) {
         // slide has a sounding note to move — previously this only latched the
         // instrument and stayed silent (item 43; needs the same TSVM fix).
         applyDuplicateCheck(eng, ts, vi, row.instrment, voice.noteVal);
-        maybeSpawnBackgroundForNNA(eng, ts, voice, vi);
+        maybeSpawnBackgroundForNNA(eng, ts, voice, vi, row.instrment);
         const trigVol = row.volumeEff === 0 ? row.volume : -1;
         triggerMetaOrNote(eng, ts, voice, vi, voice.noteVal, row.instrment, trigVol);
       } else if (row.instrment !== 0 && !eng.instruments[row.instrment].isMeta) {
@@ -322,7 +324,7 @@ export function applyTrackerRow(eng, ts, playhead) {
         scheduleDxnyAction(voice, sArg, sDelayTick);
       } else {
         applyDuplicateCheck(eng, ts, vi, row.instrment, note);
-        maybeSpawnBackgroundForNNA(eng, ts, voice, vi);
+        maybeSpawnBackgroundForNNA(eng, ts, voice, vi, row.instrment);
         const trigVol = row.volumeEff === 0 ? row.volume : -1;
         triggerMetaOrNote(eng, ts, voice, vi, note, row.instrment, trigVol);
         scheduleDxnyAction(voice, sArg, sDelayTick);
@@ -369,6 +371,36 @@ import { applyActiveSample, rowVolumeFromDefault } from "./trigger.js";
 function applyInstrumentChange(eng, ts, voice, newInst, newPatch,
                               reAttack = false, mayCarry = false) {
   applyActiveSample(voice, newInst, newPatch);
+  // An OPL voice takes the new patch onto the channel it is sounding, as a
+  // driver writes a patch change into a keyed channel; an instrument byte on a
+  // porta row then re-attacks its envelopes without restarting the phase — the
+  // OPL reading of "every envelope back to the start, the sample position
+  // kept" (§5.5.2). A change between the chip and a sample has no channel to
+  // carry: a sampled note starts a fresh channel, an OPL note a sampled read.
+  if (newInst.opl !== null && voice.opl !== null) {
+    voice.opl.patch = newInst.opl;
+    voice.opl.gen = -1;
+    if (reAttack) oplReattack(voice.opl);
+  } else if (newInst.opl !== null) {
+    // A sampled note handed an OPL instrument has no channel to carry: it
+    // gets a fresh one, keyed at the note it is already playing.
+    voice.opl = new OplState();
+    oplKeyOn(voice.opl, newInst.opl, false);
+  } else {
+    voice.opl = null;
+  }
+  // A voice sounding a formant instrument (item 212) keeps saying its syllable under the new record's
+  // tract (formantRelatch); a sampled note handed one starts its tract at the
+  // vowel, since the note's onset is long past. Neither replays an onset — the
+  // re-attack is the envelopes', not the syllable's.
+  if (newInst.formant !== null && voice.formant !== null) {
+    formantRelatch(voice.formant, newInst.formant);
+  } else if (newInst.formant !== null) {
+    voice.formant = new FormantState();
+    formantStartAtVowel(voice.formant, newInst.formant);
+  } else {
+    voice.formant = null;
+  }
   const seedVol = rowVolumeFromDefault(newInst, newPatch, ts.volMax);
   voice.noteVolume = seedVol;
   voice.rowVolume = seedVol;
@@ -487,11 +519,21 @@ export function resetPatternLoopState(ts) {
  * Called once when tickInRow has just wrapped past tickRate.
  */
 export function advanceRow(eng, ts, playhead) {
+  advanceRowPosition(eng, ts, playhead);
+  applyTrackerRow(eng, ts, playhead);
+}
+
+/**
+ * advanceRow's first half: move the position to the row that plays next —
+ * the same row again while a pattern delay (S$Ex) repeats it, else wherever a
+ * pending B/C/S$Bx jump or the cue's end sends it — without applying it. A
+ * chase (chase.js) needs the two apart, to stop BEFORE the row it is after.
+ */
+export function advanceRowPosition(eng, ts, playhead) {
   // Pattern delay (S$Ex): replay the same row patternDelayRemaining more times.
   if (ts.patternDelayRemaining > 0) {
     ts.patternDelayRemaining--;
     ts.patternDelayActive = true;
-    applyTrackerRow(eng, ts, playhead);
     return;
   }
   ts.patternDelayActive = false;
@@ -526,5 +568,4 @@ export function advanceRow(eng, ts, playhead) {
       resetPatternLoopState(ts);
     }
   }
-  applyTrackerRow(eng, ts, playhead);
 }
