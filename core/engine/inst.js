@@ -7,8 +7,11 @@ import {
   OplPatch, decodeOplPatch, OPL_BLOCK_START, OPL_BLOCK_LEN,
 } from "./opl.js";
 import {
+  PsgPatch, decodePsgPatch, psgClearRuntime, PSG_BLOCK_START, PSG_BLOCK_LEN,
+} from "./psg.js";
+import {
   FormantPatch, decodeFormantBlock, FORMANT_BLOCK_START, FORMANT_BLOCK_LEN,
-  FORMANT_RECORD_HEADER, META_TYPE_FORMANT,
+  FORMANT_RECORD_HEADER, META_TYPE_FORMANT, formantSourceInstOf,
 } from "./formant.js";
 
 
@@ -315,13 +318,50 @@ export function layerNote(layer, noteVal) {
  *  count + bytes 2..3 sentinel, then 10 bytes per layer. */
 export const META_MAX_LAYERS = 25;
 
+// ── Metainstrument tiers ──────────────────────────────────────────────────
+// The type nibble is split into two tiers, and the split is the whole of the
+// recursion rule (§7.4):
+//
+//   0…7    HIGH META — a kind assembled out of something else: Layered (0),
+//          Formant (1), FM (4). Its table, or its glottal source, names
+//          SOURCES it sounds through.
+//   8…13   LOW META — a kind that is a sound generator of its own, standing
+//          where an ordinary instrument's sample stands: OPL (8), PSG (9).
+//          It holds no table and names nothing, so it cannot recurse.
+//   14, 15 RESERVED.
+//
+// A high meta MUST be able to take a low meta as a source — as a layer, as an
+// operator, as a formant's glottal source — exactly as it takes an ordinary
+// instrument. A high meta never takes a high meta, with the one exception the
+// format has always had: a layer may name a formant instrument, which has no
+// table and so cannot recurse either.
+//
+// The two words are the code's own. The format and the manual speak of the
+// kinds by name.
+export const META_TIER_NONE = -1;     // an ordinary instrument
+export const META_TIER_HIGH = 0;
+export const META_TIER_LOW = 1;
+export const META_TIER_RESERVED = 2;
+export const META_HIGH_FIRST = 0;
+export const META_HIGH_LAST = 7;
+export const META_LOW_FIRST = 8;
+export const META_LOW_LAST = 13;
+
+/** The tier a type nibble belongs to. */
+export function metaTierOf(type) {
+  const t = type & 0x0f;
+  if (t <= META_HIGH_LAST) return META_TIER_HIGH;
+  if (t <= META_LOW_LAST) return META_TIER_LOW;
+  return META_TIER_RESERVED;
+}
+
 // ── Metainstrument types (record byte 0, high nibble) ─────────────────────
 /** Type 0 — LAYERED: every layer whose rectangle covers the trigger sounds on
- *  its own voice, mixed in parallel (§7.4). */
+ *  its own voice, mixed in parallel (§7.5). */
 export const META_TYPE_LAYERED = 0;
 /**
  * Type 1 — FORMANT (item 212): an ordinary instrument record whose sample is a
- * glottal source played through a vocal tract (formant.js, §7.8). Like the OPL
+ * glottal source played through a vocal tract (formant.js, §7.6). Like the OPL
  * kind it has no table: bytes 0…3 are the header, the second pitch/filter slot
  * carries the tract, and the source's pool pointer — which the header took —
  * lives at the start of that block. `samplePtr` mirrors it, so everything that
@@ -336,17 +376,29 @@ export const META_TYPE_LAYERED = 0;
 export const META_TYPE_FM = 4;
 /**
  * Type 8 — OPL (item 209): an ordinary instrument record with a YM3812 /
- * YMF262 channel in place of its sample (§7.7). No table: bytes 0…3 are the
+ * YMF262 channel in place of its sample (§7.8). No table: bytes 0…3 are the
  * Metainstrument header, every ordinary field after them keeps its meaning,
  * and the second pitch/filter envelope slot (bytes 197…250) carries the
  * patch. Not a layer table, so `isMeta` stays false and everything that asks
  * "is this an ordinary instrument?" — the trigger, the porta re-attack, the
  * envelope walkers — treats it as one; `isOpl` is what the renderer asks.
+ * The first low-meta kind: a layer, an FM operator and a formant
+ * instrument's glottal source may all be one.
  */
 export const META_TYPE_OPL = 8;
 /** A type-8 record's first four bytes: the type nibble, a reserved count
  *  byte, and the two `$FF` sentinels that make it a Metainstrument at all. */
 export const OPL_RECORD_HEADER = Object.freeze([0x80, 0x00, 0xff, 0xff]);
+/**
+ * Type 9 — PSG: an ordinary instrument record with two programmable-sound-
+ * generator oscillators in place of its sample (psg.js, §7.9). Laid out as
+ * the OPL kind is: bytes 0…3 the header, every ordinary field after them
+ * keeping its meaning, and the second pitch/filter slot (bytes 197…250)
+ * carrying the patch. The second low-meta kind; `isPsg` is what the renderer
+ * asks.
+ */
+export const META_TYPE_PSG = 9;
+export const PSG_RECORD_HEADER = Object.freeze([0x90, 0x00, 0xff, 0xff]);
 
 /**
  * Operators an FM rack can hold. The whole rack — 10 bytes an operator plus the
@@ -360,7 +412,7 @@ export const FM_MAX_OPERATORS = 16;
 /** Bytes of a 256-byte record the operator rack and its program share. */
 export const FM_BUDGET_BYTES = 252;
 
-// ── RPN word classes (§7.6) ──────────────────────────────────────────────
+// ── RPN word classes (§7.7) ──────────────────────────────────────────────
 // A word is read as (class, operand): the top nibble pair picks the class and
 // the low 10 bits the operator it addresses. $FFxx is the operator space, which
 // no operand word can collide with because an operand's index is 10-bit.
@@ -522,19 +574,29 @@ export function buildMetaRecord(layers, {
 }
 
 /**
- * A whole type-8 record around a 54-byte OPL patch block (§7.7): the header,
+ * A whole type-8 record around a 54-byte OPL patch block (§7.8): the header,
  * the patch where the second pitch/filter envelope would be, and an ordinary
  * instrument's neutral defaults everywhere else — no envelopes, full global
  * volume, centre pan, the filter open, full default note volume, the tracker
  * C2SPD. `fields` overrides any of them by name: {rate, detune, nna, fadeout,
  * pan, percussion, globalVolume, noteVolume}.
  */
-export function buildOplRecord(block, {
+export function buildOplRecord(block, fields = {}) {
+  return buildChipRecord(OPL_RECORD_HEADER, block, OPL_BLOCK_START, OPL_BLOCK_LEN, fields);
+}
+
+/** A whole type-9 record around a 54-byte PSG patch block (§7.9), with
+ *  buildOplRecord's defaults and overrides. */
+export function buildPsgRecord(block, fields = {}) {
+  return buildChipRecord(PSG_RECORD_HEADER, block, PSG_BLOCK_START, PSG_BLOCK_LEN, fields);
+}
+
+function buildChipRecord(header, block, blockStart, blockLen, {
   rate = 8363, detune = 0, nna = 1, fadeout = 0, pan = 0x80, percussion = false,
   globalVolume = 0xff, noteVolume = 0xff,
 } = {}) {
   const r = new Uint8Array(256);
-  for (let i = 0; i < 4; i++) r[i] = OPL_RECORD_HEADER[i];
+  for (let i = 0; i < 4; i++) r[i] = header[i];
   r[6] = rate & 0xff; r[7] = (rate >>> 8) & 0xff;
   r[14] = percussion ? 0x10 : 0;
   for (let i = 0; i < 25; i++) r[21 + 2 * i] = 0x3f;   // vol env nodes (absent)
@@ -550,24 +612,29 @@ export function buildOplRecord(block, {
   r[184] = d & 0xff; r[185] = (d >>> 8) & 0xff;
   r[186] = (nna & 3) | (((nna >>> 2) & 1) << 5);
   r[196] = noteVolume & 0xff;
-  r.set(block.subarray(0, OPL_BLOCK_LEN), OPL_BLOCK_START);
+  r.set(block.subarray(0, blockLen), blockStart);
   return r;
 }
 
 /**
- * A whole type-1 record around a 54-byte tract block (§7.8): the header, the
+ * A whole type-1 record around a 54-byte tract block (§7.6): the header, the
  * source sample's fields where an ordinary sample's are, the block where the
  * second pitch/filter envelope would be, and an ordinary instrument's neutral
  * defaults elsewhere. `src` = {ptr, len, rate, playStart, loopStart, loopEnd,
  * loopMode}; the block's own pointer bytes are overwritten with `src.ptr`.
- * `fields` overrides the rest by name, as buildOplRecord's do.
+ * `fields` overrides the rest by name, as buildOplRecord's do; `sourceInst`
+ * names an OPL instrument to sing with in place of the sample.
  */
 export function buildFormantRecord(block, src, {
   detune = 0, nna = 0, fadeout = 0, pan = 0x80, percussion = false,
-  globalVolume = 0xff, noteVolume = 0xff, dct = 0, dca = 0,
+  globalVolume = 0xff, noteVolume = 0xff, dct = 0, dca = 0, sourceInst = 0,
 } = {}) {
   const r = new Uint8Array(256);
   for (let i = 0; i < 4; i++) r[i] = FORMANT_RECORD_HEADER[i];
+  // The source instrument (§7.6), 0 for the sample: bits 8…9 in byte 0's two
+  // low bits, bits 0…7 in byte 1.
+  r[0] |= (sourceInst >>> 8) & 0x03;
+  r[1] = sourceInst & 0xff;
   const w16 = (o, v) => { r[o] = v & 0xff; r[o + 1] = (v >>> 8) & 0xff; };
   w16(4, src.len ?? 0);
   w16(6, src.rate ?? 0);
@@ -686,6 +753,11 @@ export class TaudInst {
     // IN PLACE on every write, so a sounding voice hears an edit at once.
     this.oplRaw = null;
     this.opl = null;
+    // PSG (type 9): the patch block's raw 54 bytes and its decoded form, or
+    // null for every other instrument. Decoded in place, as OPL's is; the
+    // decoded patch also carries the run-time overlay S $Axxx writes.
+    this.psgRaw = null;
+    this.psg = null;
     // Formant instrument (type 1, item 212): the tract block's raw 54 bytes and its
     // decoded form, or null for every other instrument. Updated in place, as
     // OPL's is. Bytes 0…2 of the raw block are NOT authoritative — the source
@@ -816,12 +888,42 @@ export class TaudInst {
   get filterSfMode() { return ((this.fadeoutHigh >>> 4) & 1) !== 0; }
   get isMeta() { return this.metaLayers !== null; }
   /** True for a type-4 rack: the layer table is an OPERATOR rack read by
-   *  `fmProgram`, not a set of parallel layers (§7.6). */
+   *  `fmProgram`, not a set of parallel layers (§7.7). */
   get isFm() { return this.metaLayers !== null && this.metaType === META_TYPE_FM; }
-  /** True for a type-8 OPL instrument: the chip in place of the sample (§7.7). */
+  /** True for a type-8 OPL instrument: the chip in place of the sample (§7.8). */
   get isOpl() { return this.opl !== null; }
-  /** True for a type-1 formant instrument: the sample through a vocal tract (§7.8). */
+  /** True for a type-9 PSG instrument: two oscillators in place of the sample (§7.9). */
+  get isPsg() { return this.psg !== null; }
+  /** The chip patch a high meta sounds this instrument through when it takes
+   *  it as a source — the OPL or the PSG patch — or null for anything else. */
+  get chipPatch() { return this.opl ?? this.psg; }
+  /** True for a type-1 formant instrument: the sample through a vocal tract (§7.6). */
   get isFormant() { return this.formant !== null; }
+  /** The instrument's tier (the block at META_TIER_*): NONE for an ordinary
+   *  instrument, else the tier of its type nibble. */
+  get metaTier() {
+    if (this.opl !== null || this.psg !== null) return META_TIER_LOW;
+    if (this.formant !== null) return META_TIER_HIGH;
+    if (this.metaLayers !== null) return metaTierOf(this.metaType);
+    return META_TIER_NONE;
+  }
+  get isHighMeta() { return this.metaTier === META_TIER_HIGH; }
+  get isLowMeta() { return this.metaTier === META_TIER_LOW; }
+  /**
+   * Every instrument this one names as a source, as 10-bit slots in record
+   * order: a table's layers or operators (a muted operator, index 0, left out),
+   * and a formant instrument's chip source. What everything that follows
+   * instrument references — renumbering, deleting, cleanup, an import's closure
+   * — walks, so a new kind of source is followed everywhere at once.
+   */
+  get sourceSlots() {
+    const out = [];
+    if (this.metaLayers !== null) {
+      for (const l of this.metaLayers) if (l.instIdx >= 1) out.push(l.instIdx & 0x3ff);
+    }
+    if (this.formant !== null && this.formant.srcInst >= 1) out.push(this.formant.srcInst);
+    return out;
+  }
 
   get defaultCutoff16() {
     if (this.cutoffOverride >= 0) return this.cutoffOverride;
@@ -839,9 +941,9 @@ export class TaudInst {
   /** First Ixmp patch whose pitch+volume rectangle contains the trigger, else null. */
   resolvePatch(noteVal, rowVolume) {
     const patches = this.extraPatches;
-    // An OPL instrument and a formant instrument have no keyboard map (§7.7, §7.8):
+    // An OPL instrument and a formant instrument have no keyboard map (§7.8, §7.6):
     // a list a project carries for either is ignored on every path.
-    if (patches === null || this.opl !== null || this.formant !== null) return null;
+    if (patches === null || this.opl !== null || this.psg !== null || this.formant !== null) return null;
     for (const p of patches) {
       if (noteVal >= p.pitchStart && noteVal <= p.pitchEnd &&
           rowVolume >= p.volumeStart && rowVolume <= p.volumeEnd) return p;
@@ -861,18 +963,22 @@ export class TaudInst {
 
   /** Load a full 256-byte record; detects the Metainstrument sentinel
    *  (samplePtr high 16 bits == 0xFFFF) and parses its layer table — which for
-   *  a type-4 record is an operator rack followed by an RPN program (§7.6). */
+   *  a type-4 record is an operator rack followed by an RPN program (§7.7). */
   loadRecord(b) {
     this.cutoffOverride = -1;
     this.resonanceOverride = -1;
     const sp = ((b[0] & 0xff) | ((b[1] & 0xff) << 8) | ((b[2] & 0xff) << 16)) + (b[3] & 0xff) * 0x1000000;
     if (((sp >>> 16) & 0xffff) === 0xffff && ((b[0] >>> 4) & 0x0f) === META_TYPE_OPL) {
       this.loadOplRecord(b);
+    } else if (((sp >>> 16) & 0xffff) === 0xffff && ((b[0] >>> 4) & 0x0f) === META_TYPE_PSG) {
+      this.loadPsgRecord(b);
     } else if (((sp >>> 16) & 0xffff) === 0xffff && ((b[0] >>> 4) & 0x0f) === META_TYPE_FORMANT) {
       this.loadFormantRecord(b);
     } else if (((sp >>> 16) & 0xffff) === 0xffff) {
       this.oplRaw = null;
       this.opl = null;
+      this.psgRaw = null;
+      this.psg = null;
       this.formantRaw = null;
       this.formant = null;
       const type = (b[0] >>> 4) & 0x0f;
@@ -924,6 +1030,8 @@ export class TaudInst {
       this.fmProgram = null;
       this.oplRaw = null;
       this.opl = null;
+      this.psgRaw = null;
+      this.psg = null;
       this.formantRaw = null;
       this.formant = null;
       const n = Math.min(256, b.length);
@@ -946,6 +1054,8 @@ export class TaudInst {
     this.extraPatches = null;
     this.formantRaw = null;
     this.formant = null;
+    this.psgRaw = null;
+    this.psg = null;
     const raw = new Uint8Array(OPL_BLOCK_LEN);
     for (let i = 0; i < OPL_BLOCK_LEN; i++) raw[i] = b[OPL_BLOCK_START + i] & 0xff;
     this.oplRaw = raw;
@@ -962,8 +1072,47 @@ export class TaudInst {
   }
 
   /**
+   * The type-9 branch of loadRecord, laid out exactly as the type-8 one: the
+   * header where the sample pointer was, the PSG patch where the second
+   * pitch/filter envelope was. The decoded patch object is reused across
+   * reloads, so the S $Axxx overlay it carries survives an edit, as invert
+   * loop's mask survives one.
+   */
+  loadPsgRecord(b) {
+    this.metaLayers = null;
+    this.metaRaw = null;
+    this.metaStrict = false;
+    this.metaType = META_TYPE_PSG;
+    this.fmProgram = null;
+    this.extraPatches = null;
+    this.formantRaw = null;
+    this.formant = null;
+    this.oplRaw = null;
+    this.opl = null;
+    const raw = new Uint8Array(PSG_BLOCK_LEN);
+    for (let i = 0; i < PSG_BLOCK_LEN; i++) raw[i] = b[PSG_BLOCK_START + i] & 0xff;
+    this.psgRaw = raw;
+    this.psg = decodePsgPatch(raw, 0, this.psg ?? new PsgPatch());
+    this.samplePtr = 0;
+    const n = Math.min(256, b.length);
+    for (let i = 4; i < n; i++) {
+      if (i >= PSG_BLOCK_START && i < PSG_BLOCK_START + PSG_BLOCK_LEN) continue;
+      this.setByte(i, b[i] & 0xff);
+    }
+    this.pf2EnvLoop = 0;
+    this.pf2EnvSustainWord = 0;
+    this.pf2Envelopes = makeEnv(0x80);
+  }
+
+  /** Drop the S $Axxx overlay (a new playback, §7.9): the patch sounds as its
+   *  record says again. A no-op on anything but a PSG instrument. */
+  resetPsgRuntime() {
+    if (this.psg !== null) psgClearRuntime(this.psg);
+  }
+
+  /**
    * The type-1 branch of loadRecord: an ordinary record, except that bytes
-   * 0…3 are the header and bytes 197…250 are the tract block (§7.8), whose
+   * 0…3 are the header and bytes 197…250 are the tract block (§7.6), whose
    * first three bytes are the source's pool pointer. An Ixmp list, if the
    * project carries one for this slot, is uploaded afterwards as for any
    * instrument: a patch replaces the source within its rectangle.
@@ -977,10 +1126,13 @@ export class TaudInst {
     this.extraPatches = null;
     this.oplRaw = null;
     this.opl = null;
+    this.psgRaw = null;
+    this.psg = null;
     const raw = new Uint8Array(FORMANT_BLOCK_LEN);
     for (let i = 0; i < FORMANT_BLOCK_LEN; i++) raw[i] = b[FORMANT_BLOCK_START + i] & 0xff;
     this.formantRaw = raw;
     this.formant = decodeFormantBlock(raw, 0, this.formant ?? new FormantPatch());
+    this.formant.srcInst = formantSourceInstOf(b[0], b[1]);
     this.samplePtr = this.formant.srcPtr;
     const n = Math.min(256, b.length);
     for (let i = 4; i < n; i++) {
@@ -1170,8 +1322,11 @@ export class TaudInst {
 
   getByteNormal(o) {
     if (this.formant !== null) {
-      // A type-1 record (§7.8): the header, then the tract block with the
+      // A type-1 record (§7.6): the header, then the tract block with the
       // source pointer — `samplePtr`, wherever an editor has moved it — first.
+      // The header's first two bytes also carry the source instrument.
+      if (o === 0) return FORMANT_RECORD_HEADER[0] | ((this.formant.srcInst >>> 8) & 0x03);
+      if (o === 1) return this.formant.srcInst & 0xff;
       if (o <= 3) return FORMANT_RECORD_HEADER[o];
       if (o >= FORMANT_BLOCK_START && o < FORMANT_BLOCK_START + FORMANT_BLOCK_LEN) {
         const r = o - FORMANT_BLOCK_START;
@@ -1180,11 +1335,18 @@ export class TaudInst {
       }
     }
     if (this.opl !== null) {
-      // A type-8 record (§7.7): the header where the sample pointer was, the
+      // A type-8 record (§7.8): the header where the sample pointer was, the
       // patch where the second pitch/filter envelope was.
       if (o <= 3) return OPL_RECORD_HEADER[o];
       if (o >= OPL_BLOCK_START && o < OPL_BLOCK_START + OPL_BLOCK_LEN) {
         return this.oplRaw[o - OPL_BLOCK_START];
+      }
+    }
+    if (this.psg !== null) {
+      // A type-9 record (§7.9), laid out as a type-8 one.
+      if (o <= 3) return PSG_RECORD_HEADER[o];
+      if (o >= PSG_BLOCK_START && o < PSG_BLOCK_START + PSG_BLOCK_LEN) {
+        return this.psgRaw[o - PSG_BLOCK_START];
       }
     }
     if (o >= 21 && o <= 70) return this._envPointGet(this.volEnvelopes, 21, o);
@@ -1251,7 +1413,17 @@ export class TaudInst {
 
   setByte(o, byte) {
     if (this.formant !== null) {
-      if (o <= 3) return; // the header is the record's kind, not a field
+      // The header is the record's kind — but for the source instrument it
+      // carries in byte 1 and byte 0's two low bits (§7.6).
+      if (o === 0) {
+        this.formant.srcInst = formantSourceInstOf(byte, this.formant.srcInst & 0xff);
+        return;
+      }
+      if (o === 1) {
+        this.formant.srcInst = formantSourceInstOf(this.formant.srcInst >>> 8, byte);
+        return;
+      }
+      if (o <= 3) return;
       if (o >= FORMANT_BLOCK_START && o < FORMANT_BLOCK_START + FORMANT_BLOCK_LEN) {
         const r = o - FORMANT_BLOCK_START;
         if (r < 3) {
@@ -1271,6 +1443,14 @@ export class TaudInst {
       if (o >= OPL_BLOCK_START && o < OPL_BLOCK_START + OPL_BLOCK_LEN) {
         this.oplRaw[o - OPL_BLOCK_START] = byte & 0xff;
         decodeOplPatch(this.oplRaw, 0, this.opl);
+        return;
+      }
+    }
+    if (this.psg !== null) {
+      if (o <= 3) return;
+      if (o >= PSG_BLOCK_START && o < PSG_BLOCK_START + PSG_BLOCK_LEN) {
+        this.psgRaw[o - PSG_BLOCK_START] = byte & 0xff;
+        decodePsgPatch(this.psgRaw, 0, this.psg);
         return;
       }
     }

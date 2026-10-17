@@ -4,7 +4,7 @@
 // New Note Action, Duplicate Check, default volume and pan, auto-vibrato, the
 // one pitch/filter envelope it keeps — whose sample is replaced by a patch for
 // a YM3812 / YMF262 channel: two operators, four, or one of the five rhythm-
-// mode drums (TAUD_FILE_FORMAT.md §7.7). This module is that channel, one per
+// mode drums (TAUD_FILE_FORMAT.md §7.8). This module is that channel, one per
 // sounding voice.
 //
 // The operator model is the IMS Archive's clean-room OPL core (iyagimusic-js
@@ -68,7 +68,7 @@ const HZ_PER_SPS = LINEAR_FREQ_C4_HZ / OPL_C4_RATE;
 
 // ── The record ────────────────────────────────────────────────────────────
 // The patch occupies what an ordinary record spends on its SECOND pitch/
-// filter envelope slot, bytes 197…250 (§7.7). Offsets below are relative to
+// filter envelope slot, bytes 197…250 (§7.8). Offsets below are relative to
 // OPL_BLOCK_START.
 
 export const OPL_BLOCK_START = 197;
@@ -193,7 +193,7 @@ const KSL_SHIFT = Int32Array.from([-1, 1, 2, 0]);
 /** MULT, doubled so ×0.5 stays an integer. */
 export const OPL_MULTIPLE_X2 = Int32Array.from([1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 20, 24, 24, 30, 30]);
 /** Sustain level in envelope steps: 3 dB a step, and 15 is −93 dB. */
-const SUSTAIN_LEVEL = Int32Array.from([0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 496]);
+export const OPL_SUSTAIN_LEVEL = Int32Array.from([0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 496]);
 /** Envelope rate duty patterns (RL = 0…3 takes 4, 5, 6 or 7 steps of 8). */
 const EG_DUTY = [
   Int32Array.from([1, 0, 1, 0, 1, 0, 1, 0]),
@@ -219,6 +219,8 @@ function triangle(p, period) {
 }
 
 /** [depth] → per-sample attenuation to add, in 1/256-log2 units. */
+export const OPL_TREMOLO_PERIOD = TREMOLO_PERIOD;
+export const OPL_VIBRATO_PERIOD = VIBRATO_PERIOD;
 const TREMOLO_TABLE = [0, 1].map((d) => {
   const t = new Float64Array(TREMOLO_PERIOD);
   for (let p = 0; p < TREMOLO_PERIOD; p++) t[p] = TREMOLO_STEPS[d] * ENV_TO_LOG * triangle(p, TREMOLO_PERIOD);
@@ -233,6 +235,10 @@ const VIBRATO_TABLE = [0, 1].map((d) => {
   }
   return t;
 });
+/** The two LFOs' tables, [shallow, deep], for the PSG instrument (psg.js),
+ *  whose oscillators take the chip's tremolo and vibrato one at a time. */
+export const OPL_TREMOLO_TABLE = TREMOLO_TABLE;
+export const OPL_VIBRATO_TABLE = VIBRATO_TABLE;
 
 // ── Waveforms ─────────────────────────────────────────────────────────────
 // A 10-bit phase to a log-domain attenuation, with the sign left in
@@ -349,7 +355,7 @@ export function decodeOplPatch(bytes, at = 0, into = new OplPatch()) {
     op.ksr = (r20 >> 4) & 1; op.mult = r20 & 0x0f;
     op.ksl = (r40 >> 6) & 3; op.tl = r40 & 0x3f;
     op.ar = (r60 >> 4) & 0x0f; op.dr = r60 & 0x0f;
-    op.sl = SUSTAIN_LEVEL[(r80 >> 4) & 0x0f]; op.rr = r80 & 0x0f;
+    op.sl = OPL_SUSTAIN_LEVEL[(r80 >> 4) & 0x0f]; op.rr = r80 & 0x0f;
     op.ws = rE0 & 7;
   }
   into.outputs = oplOutputMask(into.kind, into.cntA, into.cntB);
@@ -464,6 +470,10 @@ export class OplState {
     // The note volume as an attenuation, cached on the volume it came from.
     this.vol = -1;
     this.volAtt = 0;
+    // Phase modulation from outside the chip, in 1/1024 of a cycle, added to
+    // every OUTPUT operator's phase while it is set: what an FM rack reading
+    // this channel as an operator writes (§5.5.1). 0 on every other path.
+    this.pm = 0;
   }
 }
 
@@ -505,6 +515,29 @@ function chipIndex(frame) {
   else if (rem >= den) { k++; rem -= den; }
   fracBox[0] = rem / den;
   return k;
+}
+
+/** chipIndex for a module that runs on the same chip clock (psg.js): the
+ *  chip sample output frame `frame` falls on; oplChipFrac() is how far past. */
+export function oplChipIndex(frame) { return chipIndex(frame); }
+export function oplChipFrac() { return fracBox[0]; }
+
+/**
+ * The key scaling an operator at `hz` takes, as retune() works it out for a
+ * melodic channel (NTS 0, the ordinary F-number ceiling): `out[0]` the rate
+ * offset KSR adds to every envelope rate, `out[1]` the key-scale level in
+ * envelope units. For a generator that borrows the chip's envelope (psg.js).
+ */
+export function oplKeyScaling(hz, ksr, ksl, out) {
+  const bf = oplBlockFnum(hz, false);
+  const block = bf >> 10, fnum = bf & 1023;
+  const ksv = (block << 1) | ((fnum >> 9) & 1);
+  let kslBase = KSL_ROM[(fnum >> 6) & 15] - 8 * (7 - block);
+  if (kslBase < 0) kslBase = 0;
+  out[0] = ksr ? ksv : ksv >> 2;
+  const shift = KSL_SHIFT[ksl & 3];
+  out[1] = shift < 0 ? 0 : (kslBase << 2) >> shift;
+  return out;
 }
 
 /** A deterministic, non-zero start for a drum's noise register: any non-zero
@@ -604,7 +637,7 @@ function retune(st, rate) {
 
 /** One envelope tick for operator `i` at chip sample `eg` (the reference
  *  core's #advanceEnvelope, Table 3-6 of the application manual). */
-function oplAdvanceEnvelope(st, i, op, eg) {
+export function oplAdvanceEnvelope(st, i, op, eg) {
   const state = st.state[i];
   if (state === EG_OFF) return;
   const rateParam = state === EG_ATTACK ? op.ar
@@ -694,15 +727,19 @@ export function oplChipStep(st, k) {
   const outputs = patch.outputs;
   const va = st.volAtt;
   const x0 = (ops[0].am ? trem : 0) + ((outputs & 1) !== 0 ? va : 0);
+  // Outside phase modulation reaches the operators the channel OUTPUTS, the
+  // way the chip's own modulator reaches its carrier; 0 changes nothing.
+  const pm = st.pm;
+  const p0 = (outputs & 1) !== 0 ? pm : 0;
   switch (patch.kind) {
     case OPL_KIND_2OP: case OPL_KIND_BD: {
       oplAdvanceEnvelope(st, 0, ops[0], k);
       oplAdvanceEnvelope(st, 1, ops[1], k);
       const x1 = (ops[1].am ? trem : 0) + va;
-      const m = operate(st, 0, ops[0], feedbackOf(st, patch.feedback), x0, vibrato);
+      const m = operate(st, 0, ops[0], feedbackOf(st, patch.feedback) + p0, x0, vibrato);
       const v = patch.cntA
-        ? m + operate(st, 1, ops[1], 0, x1, vibrato)
-        : operate(st, 1, ops[1], m, x1, vibrato);
+        ? m + operate(st, 1, ops[1], pm, x1, vibrato)
+        : operate(st, 1, ops[1], m + pm, x1, vibrato);
       return patch.kind === OPL_KIND_BD ? OPL_RHYTHM_MIX * v : v;
     }
     case OPL_KIND_4OP: {
@@ -710,23 +747,24 @@ export function oplChipStep(st, k) {
       const x1 = ops[1].am ? trem : 0;
       const x2 = (ops[2].am ? trem : 0) + ((outputs & 4) !== 0 ? va : 0);
       const x3 = (ops[3].am ? trem : 0) + va;
-      const o1 = operate(st, 0, ops[0], feedbackOf(st, patch.feedback), x0, vibrato);
+      const p2 = (outputs & 4) !== 0 ? pm : 0;
+      const o1 = operate(st, 0, ops[0], feedbackOf(st, patch.feedback) + p0, x0, vibrato);
       if (!patch.cntA) {
         const o2 = operate(st, 1, ops[1], o1, x1, vibrato);
-        const o3 = operate(st, 2, ops[2], o2, x2, vibrato);
+        const o3 = operate(st, 2, ops[2], o2 + p2, x2, vibrato);
         return patch.cntB
-          ? o3 + operate(st, 3, ops[3], 0, x3, vibrato)
-          : operate(st, 3, ops[3], o3, x3, vibrato);
+          ? o3 + operate(st, 3, ops[3], pm, x3, vibrato)
+          : operate(st, 3, ops[3], o3 + pm, x3, vibrato);
       }
       const o2 = operate(st, 1, ops[1], 0, x1, vibrato);
-      const o3 = operate(st, 2, ops[2], o2, x2, vibrato);
+      const o3 = operate(st, 2, ops[2], o2 + p2, x2, vibrato);
       return patch.cntB
-        ? o1 + o3 + operate(st, 3, ops[3], 0, x3, vibrato)
-        : o1 + operate(st, 3, ops[3], o3, x3, vibrato);
+        ? o1 + o3 + operate(st, 3, ops[3], pm, x3, vibrato)
+        : o1 + operate(st, 3, ops[3], o3 + pm, x3, vibrato);
     }
     case OPL_KIND_TOM:
       oplAdvanceEnvelope(st, 0, ops[0], k);
-      return OPL_RHYTHM_MIX * operate(st, 0, ops[0], 0, x0, vibrato);
+      return OPL_RHYTHM_MIX * operate(st, 0, ops[0], pm, x0, vibrato);
     case OPL_KIND_SD: case OPL_KIND_TC: case OPL_KIND_HH: {
       oplAdvanceEnvelope(st, 0, ops[0], k);
       // Every accumulator advances before any of the three is sampled, and
@@ -746,7 +784,7 @@ export function oplChipStep(st, k) {
           ? (xor << 9) | (xor ^ noise ? 0x0d0 : 0x034)
           : (xor << 9) | 0x100;
       }
-      return OPL_RHYTHM_MIX * rhythmOperator(st, 0, ops[0], phase, x0);
+      return OPL_RHYTHM_MIX * rhythmOperator(st, 0, ops[0], (phase + pm) & 0x3ff, x0);
     }
     default:
       return 0;
@@ -760,7 +798,7 @@ export function oplChipStep(st, k) {
  * counts as finished too, so a patch that can never sound does not hold a
  * voice for ever.
  */
-function channelAlive(st) {
+export function oplChannelAlive(st) {
   const patch = st.patch;
   const outputs = patch.outputs;
   for (let i = 0; i < 4; i++) {
@@ -796,12 +834,25 @@ function volumeAttenuation(vol) {
  */
 export function renderOplVoice(voice, frame) {
   const st = voice.opl;
+  if (st.patch === null) return 0;
+  const s = oplRender(st, frame, voice.currentPlaybackRate, voice.currentMixVolume, voice.keyOff);
+  if (!oplChannelAlive(st)) voice.active = false;
+  return s;
+}
+
+/**
+ * The channel `st` at output frame `frame`, played at playback rate `rate`
+ * with note volume `vol`, keyed off once `keyOff` is — renderOplVoice's whole
+ * work but the voice's own deactivation, so that a chip channel can be read
+ * by something other than the voice it sounds on: an FM rack reading it as an
+ * operator, a formant instrument as its glottal source. Both read it at unity
+ * volume, since the note's volume is theirs to apply to what they make of it.
+ */
+export function oplRender(st, frame, rate, vol, keyOff) {
   const patch = st.patch;
   if (patch === null) return 0;
-  if (voice.keyOff && st.keyed) oplKeyOff(st);
-  const rate = voice.currentPlaybackRate;
+  if (keyOff && st.keyed) oplKeyOff(st);
   if (rate !== st.rate || patch.gen !== st.gen) retune(st, rate);
-  const vol = voice.currentMixVolume;
   if (vol !== st.vol) { st.vol = vol; st.volAtt = volumeAttenuation(vol); }
   const k = chipIndex(frame);
   const frac = fracBox[0];
@@ -820,6 +871,5 @@ export function renderOplVoice(voice, frame) {
     st.last = st.cur;
     st.cur = oplChipStep(st, st.k);
   }
-  if (!channelAlive(st)) voice.active = false;
   return (st.last + (st.cur - st.last) * frac) * OUTPUT_SCALE;
 }

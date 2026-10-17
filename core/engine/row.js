@@ -12,7 +12,11 @@ import {
 import { applyKeyLift, envPresent, envCarry, seedPfRole, pfIdxBox, pfTimeBox } from "./envelope.js";
 import { startFastFade, startCutRamp } from "./sampler.js";
 import { OplState, oplKeyOn, oplReattack } from "./opl.js";
-import { FormantState, formantRelatch, formantStartAtVowel } from "./formant.js";
+import { PsgState, psgKeyOn, psgReattack } from "./psg.js";
+import {
+  FormantState, formantRelatch, formantStartAtVowel,
+  formantChipSource, formantChipRate, formantKeySource, formantRelatchSource,
+} from "./formant.js";
 import { applyEffectRow } from "./effects.js";
 
 /**
@@ -371,6 +375,10 @@ import { applyActiveSample, rowVolumeFromDefault } from "./trigger.js";
 function applyInstrumentChange(eng, ts, voice, newInst, newPatch,
                               reAttack = false, mayCarry = false) {
   applyActiveSample(voice, newInst, newPatch);
+  // A formant instrument sung from an OPL instrument takes the chip's C2SPD
+  // where its sample's rate would be, as on a trigger (trigger.js).
+  const formantChip = newInst.formant !== null ? formantChipSource(eng.instruments, newInst) : null;
+  if (formantChip !== null) voice.activeSamplingRate = formantChipRate(formantChip);
   // An OPL voice takes the new patch onto the channel it is sounding, as a
   // driver writes a patch change into a keyed channel; an instrument byte on a
   // porta row then re-attacks its envelopes without restarting the phase — the
@@ -389,15 +397,30 @@ function applyInstrumentChange(eng, ts, voice, newInst, newPatch,
   } else {
     voice.opl = null;
   }
+  // A PSG pair takes a new patch the same way, its internal status kept.
+  if (newInst.psg !== null && voice.psg !== null) {
+    voice.psg.patch = newInst.psg;
+    voice.psg.gen = -1;
+    if (reAttack) psgReattack(voice.psg);
+  } else if (newInst.psg !== null) {
+    voice.psg = new PsgState();
+    psgKeyOn(voice.psg, newInst.psg, false);
+  } else {
+    voice.psg = null;
+  }
   // A voice sounding a formant instrument (item 212) keeps saying its syllable under the new record's
   // tract (formantRelatch); a sampled note handed one starts its tract at the
   // vowel, since the note's onset is long past. Neither replays an onset — the
   // re-attack is the envelopes', not the syllable's.
+  // Its source follows the record, a chip channel taking a new patch where it
+  // stands (formantRelatchSource).
   if (newInst.formant !== null && voice.formant !== null) {
     formantRelatch(voice.formant, newInst.formant);
+    formantRelatchSource(voice.formant, formantChip !== null ? formantChip.chipPatch : null);
   } else if (newInst.formant !== null) {
     voice.formant = new FormantState();
     formantStartAtVowel(voice.formant, newInst.formant);
+    formantKeySource(voice.formant, formantChip !== null ? formantChip.chipPatch : null);
   } else {
     voice.formant = null;
   }
