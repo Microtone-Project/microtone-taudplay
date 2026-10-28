@@ -148,7 +148,11 @@ let pcm = r.render(30, (rr, frame) => {
 ### `TaudRenderer` (anywhere)
 
 The same knob, probes, interrupts and transport, plus `renderChunk()`,
-`render(seconds, onChunk)` and `toWav(seconds, { sampleRate })`.
+`render(seconds, onChunk)` and `toWav(seconds, { sampleRate, quality })` —
+`quality` is `"clean"` (16-bit with a light TPDF dither, the default) or
+`"gritty"` (the device's own noise-shaped 8-bit dither; at 48 kHz, byte for
+byte what the Taud device plays). `encodeWav(f32, rate, quality)` is the
+same encoder on its own.
 
 ## What is *not* here
 
@@ -180,7 +184,7 @@ The vendored decompressors keep their own (MIT) licences:
 
 ---
 
-Generated from Microtone.js 3.13.2 (engine 63c8b5f8a219) by
+Generated from Microtone.js 4.0.0 (engine 83925c80dcf0) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.
