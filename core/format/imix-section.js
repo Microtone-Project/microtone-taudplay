@@ -27,9 +27,9 @@
 
 import {
   IMX_EQUIPMENT, IMX_WET_APPLICABLE, IMX_KNOWN_VERSION, IMX_MAX_ID,
-  IMX_ITRM, IMX_EQU1, IMX_EQU2, IMX_COMP, IMX_DEQ1, IMX_DEQ2, IMX_SATU,
+  IMX_ITRM, IMX_EXPD, IMX_EQU1, IMX_EQU2, IMX_COMP, IMX_DEQ1, IMX_DEQ2, IMX_TSH1, IMX_SATU,
   IMX_UNIS, IMX_VERB, IMX_DLAY, IMX_LIMI, IMX_MXTL,
-  IMX_EQ_MAX_BANDS, IMX_EQ_SHAPES, IMX_SLOPES, IMX_COMP_MAX_BANDS, IMX_DEQ_BANDS,
+  IMX_EQ_MAX_BANDS, IMX_EQ_SHAPES, IMX_SLOPES, IMX_COMP_MAX_BANDS, IMX_TSH_MAX_BANDS, IMX_DEQ_BANDS,
   IMX_SAT_CURVES, IMX_UNIS_MIN_VOICES, IMX_UNIS_MAX_VOICES, IMX_LFO_WAVES,
   isCutShape, normaliseImixBlock, normaliseEquipment,
 } from "../engine/imix.js";
@@ -43,12 +43,13 @@ const KNOWN = new Set(IMX_EQUIPMENT);
 const LFO_BYTES = 12;
 const EQ_BAND = 16;
 const COMP_BAND = 28;
+const TSH_BAND = 24;
 const DEQ_BAND = 48;
 
 /** The size of a known version-0 payload, or null when it depends on a count
- *  that has to be read first (equ, comp). */
+ *  that has to be read first (equ, comp, tsh). */
 const FIXED_SIZE = {
-  [IMX_ITRM]: 8, [IMX_DEQ1]: 8 + IMX_DEQ_BANDS * DEQ_BAND, [IMX_DEQ2]: 8 + IMX_DEQ_BANDS * DEQ_BAND,
+  [IMX_ITRM]: 8, [IMX_EXPD]: 48, [IMX_DEQ1]: 8 + IMX_DEQ_BANDS * DEQ_BAND, [IMX_DEQ2]: 8 + IMX_DEQ_BANDS * DEQ_BAND,
   [IMX_SATU]: 24, [IMX_UNIS]: 20 + 2 * LFO_BYTES, [IMX_VERB]: 24, [IMX_DLAY]: 32,
   [IMX_LIMI]: 20, [IMX_MXTL]: 16,
 };
@@ -73,6 +74,17 @@ function readLfo(dv, o) {
   };
 }
 
+/** A multiband piece's n − 1 crossovers at +8, which must rise strictly. */
+function readCrossovers(f32, n, id) {
+  const crossovers = [];
+  for (let i = 0; i < n - 1; i++) {
+    const x = f32(8 + 4 * i);
+    if (i > 0 && !(x > crossovers[i - 1])) fail(`${id} crossovers are not strictly ascending`);
+    crossovers.push(x);
+  }
+  return crossovers;
+}
+
 /** Decode one known, version-0 payload into a parameter record (not yet
  *  clamped). Throws Invalid on a contradiction. */
 function decodeEquipment(id, p) {
@@ -84,6 +96,15 @@ function decodeEquipment(id, p) {
   if (!IMX_WET_APPLICABLE.has(id) && p[1] !== 0) fail(`${id} has no wet/dry, yet carries ${p[1]}`);
   switch (id) {
     case IMX_ITRM: return { ...common, gainDb: f32(4) };
+    case IMX_EXPD:
+      if (p[5] > 1) fail(`expd detector ${p[5]} is undefined`);
+      // A floor above the threshold says the sound is shut where it should pass.
+      if (f32(12) > f32(8)) fail("expd floor is above its threshold");
+      return {
+        ...common, keyFilter: (p[4] & 1) !== 0, detector: p[5],
+        threshDb: f32(8), floorDb: f32(12), ratio: f32(16), rangeDb: f32(20), attackMs: f32(24), holdMs: f32(28),
+        releaseMs: f32(32), hysteresisDb: f32(36), keyLowCut: f32(40), keyHighCut: f32(44),
+      };
     case IMX_EQU1:
     case IMX_EQU2: {
       if (p.length < 8) fail(`${id} payload is too short`);
@@ -107,12 +128,7 @@ function decodeEquipment(id, p) {
       if (n < 1 || n > IMX_COMP_MAX_BANDS) fail(`comp declares ${n} bands; 1…${IMX_COMP_MAX_BANDS}`);
       if (p[5] > 1) fail(`comp detector ${p[5]} is undefined`);
       if (p.length !== 8 + 4 * (n - 1) + COMP_BAND * n) fail(`comp payload size disagrees with its ${n} bands`);
-      const crossovers = [];
-      for (let i = 0; i < n - 1; i++) {
-        const x = f32(8 + 4 * i);
-        if (i > 0 && !(x > crossovers[i - 1])) fail("comp crossovers are not strictly ascending");
-        crossovers.push(x);
-      }
+      const crossovers = readCrossovers(f32, n, id);
       const base = 8 + 4 * (n - 1);
       const bands = [];
       for (let i = 0; i < n; i++) {
@@ -123,6 +139,23 @@ function decodeEquipment(id, p) {
         });
       }
       return { ...common, detector: p[5], crossovers, bands };
+    }
+    case IMX_TSH1: {
+      if (p.length < 8) fail(`${id} payload is too short`);
+      const n = p[4];
+      if (n < 1 || n > IMX_TSH_MAX_BANDS) fail(`${id} declares ${n} bands; 1…${IMX_TSH_MAX_BANDS}`);
+      if (p.length !== 8 + 4 * (n - 1) + TSH_BAND * n) fail(`${id} payload size disagrees with its ${n} bands`);
+      const crossovers = readCrossovers(f32, n, id);
+      const base = 8 + 4 * (n - 1);
+      const bands = [];
+      for (let i = 0; i < n; i++) {
+        const o = base + i * TSH_BAND;
+        bands.push({
+          on: (p[o] & 1) !== 0, attackDb: f32(o + 4), sustainDb: f32(o + 8), attackMs: f32(o + 12),
+          releaseMs: f32(o + 16), outDb: f32(o + 20),
+        });
+      }
+      return { ...common, crossovers, bands };
     }
     case IMX_DEQ1:
     case IMX_DEQ2: {
@@ -306,6 +339,11 @@ export function encodeEquipment(id, eIn) {
   w.zeros(2);
   switch (id) {
     case IMX_ITRM: w.f32(e.gainDb); break;
+    case IMX_EXPD:
+      w.u8(e.keyFilter ? 1 : 0); w.u8(e.detector); w.zeros(2);
+      w.f32(e.threshDb); w.f32(e.floorDb); w.f32(e.ratio); w.f32(e.rangeDb); w.f32(e.attackMs); w.f32(e.holdMs);
+      w.f32(e.releaseMs); w.f32(e.hysteresisDb); w.f32(e.keyLowCut); w.f32(e.keyHighCut);
+      break;
     case IMX_EQU1:
     case IMX_EQU2:
       w.u8(e.bands.length); w.zeros(3);
@@ -321,6 +359,14 @@ export function encodeEquipment(id, eIn) {
         w.u8(b.on ? 1 : 0); w.zeros(3);
         w.f32(b.threshDb); w.f32(b.ratio); w.f32(b.attackMs); w.f32(b.releaseMs);
         w.f32(b.kneeDb); w.f32(b.makeupDb);
+      }
+      break;
+    case IMX_TSH1:
+      w.u8(e.bands.length); w.zeros(3);
+      for (const x of e.crossovers) w.f32(x);
+      for (const b of e.bands) {
+        w.u8(b.on ? 1 : 0); w.zeros(3);
+        w.f32(b.attackDb); w.f32(b.sustainDb); w.f32(b.attackMs); w.f32(b.releaseMs); w.f32(b.outDb);
       }
       break;
     case IMX_DEQ1:
