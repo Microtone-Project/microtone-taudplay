@@ -177,6 +177,17 @@ LGPL-3.0-or-later — see `COPYING.LESSER` (and `COPYING` for the GPL text it
 builds on). You may link this library into a proprietary application; changes
 *to the library itself* must be shared.
 
+Where the LGPL does not fit — a console title, a static build, changes to the
+library you cannot publish — taudplay is also available under a proprietary
+licence: write to <microtone@curioustorvald.com>. It is offered beside the
+LGPL, never instead of it.
+
+Contributions are welcome once their author has agreed to the
+[Microtone Contributor Licence Agreement](https://github.com/Microtone-Project/Microtone.js/blob/master/CLA.md):
+you keep your copyright, and what is merged stays LGPL. Changes to the engine
+itself go to [Microtone.js](https://github.com/Microtone-Project/Microtone.js),
+where it is authored; this repository is generated from there.
+
 The vendored decompressors keep their own (MIT) licences:
 [fflate](https://github.com/101arrowz/fflate) and
 [fzstd](https://github.com/101arrowz/fzstd). The binaural filter set in
@@ -184,7 +195,7 @@ The vendored decompressors keep their own (MIT) licences:
 
 ---
 
-Generated from Microtone.js 4.6.0 (engine 7f44750bf012) by
+Generated from Microtone.js 4.7.0 (engine d9a64e6f4ff3) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.

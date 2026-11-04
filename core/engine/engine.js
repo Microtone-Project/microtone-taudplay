@@ -206,6 +206,21 @@ export class TaudEngine {
   }
 
   /**
+   * Install the project's LYRICS (item 280, the `ILyr` section, §9.17): an
+   * array of decoded entries ({instId, syllables, recipes}, lyric-section.js),
+   * replacing whatever was installed — an instrument no entry names has none.
+   * The entries are the engine's to keep; the host must not mutate them.
+   */
+  setLyrics(entries) {
+    const by = new Map();
+    for (const e of entries ?? []) if (!by.has(e.instId & 0x3ff)) by.set(e.instId & 0x3ff, e);
+    for (const inst of this.instruments) {
+      const e = by.get(inst.index) ?? null;
+      if (e !== inst.lyricEntry) inst.setLyric(e);
+    }
+  }
+
+  /**
    * Upload an Ixmp "extra samples" block for instrument slot. Patches are
    * variable-length: version byte (0b x00Pfpvi) + 30 common bytes + optional
    * x/v/p/f/P blocks in that order (AudioJSR223Delegate.kt:357-430).
@@ -565,7 +580,16 @@ export class TaudEngine {
     const v = Math.min(Math.max(vi, 0), TOTAL_VOICES - 1);
     note &= 0xffff;
     inst &= 0x3ff;
-    triggerMetaOrNote(this, ts, ts.voices[v], v, note, inst, -1);
+    // A lyric instrument jammed sings its lyrics on, a syllable a key, over
+    // the whole jam bank — the bank rotates voices, so the place is the
+    // playhead's, kept per instrument (item 280).
+    const lyric = this.instruments[inst].lyric !== null;
+    if (lyric) {
+      if (ts.jamLyricInst !== inst) { ts.jamLyricInst = inst; ts.jamLyricPos = 0; }
+      ts.voices[v].lyricPos = ts.jamLyricPos;
+    }
+    triggerMetaOrNote(this, ts, ts.voices[v], v, note, inst, -1, !lyric);
+    if (lyric) ts.jamLyricPos = ts.voices[v].lyricPos;
     // Audition-only (item 51): a STRICT metainstrument only sounds where its
     // Ixmp zones actually place a sample, so an arbitrary jammed pitch is often
     // silent. In pure-audition contexts (Instruments/Samples views) retry at the
@@ -916,11 +940,31 @@ export class TaudEngine {
    * (an `S $Afgr`, or an instrument change still gliding), as the chart bytes
    * it stands at now, fractional mid-glide, and where a glide is heading. A
    * voice singing the record's vowel is not listed: the record shows it.
+   *
+   * A lyric instrument's (item 280) also lists `lyric`: the syllables its
+   * notes are singing now, as indices into its lyrics, ascending, each once —
+   * the lanes' and jammed notes' (a note let go still sings until it is
+   * silent), not the ghosts' an NNA left behind. Empty for any other.
    */
   getInstrumentFormantState(slot) {
-    const patch = this.instruments[slot & 0x3ff].formant;
+    const inst = this.instruments[slot & 0x3ff];
+    const patch = inst.formant;
     if (patch === null) return null;
     const voices = [];
+    const lyric = [];
+    if (inst.lyric !== null) {
+      for (const p of this.playheads) {
+        const ts = p.trackerState;
+        if (ts === null || ts === undefined) continue;
+        for (const v of ts.voices) {
+          const st = v.formant;
+          if (!v.active || st === null || st.patch === null || st.patch.lyricOf !== patch) continue;
+          const k = inst.lyric.indexOf(st.patch);
+          if (k >= 0 && !lyric.includes(k)) lyric.push(k);
+        }
+      }
+      lyric.sort((a, b) => a - b);
+    }
     for (const p of this.playheads) {
       const ts = p.trackerState;
       if (ts === null || ts === undefined) continue;
@@ -928,7 +972,9 @@ export class TaudEngine {
         for (const v of list) {
           if (voices.length >= FORMANT_LIVE_MAX) break;
           const st = v.formant;
-          if (!v.active || st === null || st.patch !== patch || !st.ownVowel) continue;
+          if (!v.active || st === null || !st.ownVowel) continue;
+          // A lyric instrument's note sings one of its syllables (item 280).
+          if (st.patch !== patch && (st.patch === null || st.patch.lyricOf !== patch)) continue;
           const gliding = st.glideLeft > 0;
           voices.push({
             front: st.vFront, open: st.vOpen, round: st.vRound,
@@ -938,7 +984,7 @@ export class TaudEngine {
         }
       }
     }
-    return { voices };
+    return { voices, lyric };
   }
 
   /** The modification's inversion mask, one bit per SAMPLE byte (item 130). */
