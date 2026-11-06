@@ -1,5 +1,10 @@
 # taudplay
 
+---
+<p align="center"><em>You are currently looking at the JavaScript version.</em></p>
+<p align="center">JavaScript · <a href="https://github.com/Microtone-Project/taudplay-c">C99</a> · <a href="https://github.com/Microtone-Project/taudplay-java">Java</a> · <a href="https://github.com/Microtone-Project/taudplay-godot">Godot 4</a> · <a href="https://github.com/Microtone-Project/taudplay-libgdx">LibGDX</a></p>
+---
+
 **Play `.taud` songs — in a browser tab, or in Node. No tracker attached.**
 
 `taudplay` is the playback half of the [Microtone](https://microtone.cc)
