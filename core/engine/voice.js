@@ -277,7 +277,16 @@ export class Voice {
     this.envFilterTimeSec = 0.0;
     this.envFilterValue = 0.5;
 
+    // fadeoutVolume is the fadeout multiplier as the TICK sets it; fadeoutMix is
+    // what the mixer multiplies by, walked to it a sample at a time (the same
+    // shape as envVolMix) so a fadeout is a slope and not a 50 Hz staircase.
     this.fadeoutVolume = 1.0;
+    this.fadeoutMix = 1.0;
+    this.fadeoutMixStep = 0.0;
+    // The lane fader and the elevation as the mixer has glided them
+    // (advanceFaderRamp / advanceElevRamp); NaN = snap on the next sample.
+    this.faderCur = NaN; this.faderAim = 0; this.faderStep = 0.0; this.faderLeft = 0;
+    this.elevCur = NaN; this.elevAim = 0.0; this.elevStep = 0.0; this.elevLeft = 0;
 
     // MilkyTracker-style anti-click ramp-out.
     this.rampOutSamples = 0;
@@ -359,6 +368,11 @@ export class Voice {
     this.filterX1 = 0.0;
     this.filterX2 = 0.0;
     this.filterCutoffCached = -1;
+    // SoundFont-mode filter glide (filter.js advanceFilterGlide): where the
+    // cutoff (cents) and Q stand, their per-sample steps and how many remain,
+    // and the refresh's targets. sfCents NaN = the next refresh lands at once.
+    this.sfCents = NaN; this.sfCentsIncr = 0.0; this.sfCentsLeft = 0; this.sfCentsAim = 0; this.sfHzAim = 0.0;
+    this.sfQ = 0.0; this.sfQIncr = 0.0; this.sfQLeft = 0; this.sfQAim = 0.0;
     this.filterResonanceCached = -1;
 
     // Per-trigger random vol/pan swing biases.

@@ -15,17 +15,17 @@ import {
   AMIGA_LED_A1, AMIGA_LED_A2, AMIGA_LED_B1, AMIGA_LED_B2,
 } from "./tables.js";
 import {
-  fetchTrackerSample, fetchTrackerSampleStereo, advanceVolumeRamp,
-  advancePitchRamp, advancePanRamp,
+  fetchTrackerSample, fetchTrackerSampleStereo, advanceVolumeRamp, advanceFadeout,
+  advancePitchRamp, advancePanRamp, advanceFaderRamp, advanceElevRamp,
 } from "./sampler.js";
-import { applyVoiceFilter, applyTaudVoiceFx } from "./filter.js";
+import { applyVoiceFilter, applyTaudVoiceFx, advanceFilterGlide } from "./filter.js";
 import { renderFmVoice } from "./fm.js";
 import { renderOplVoice } from "./opl.js";
 import { renderPsgVoice } from "./psg.js";
 import { renderFormantVoice } from "./formant.js";
 import { CHAN_MODE_MATRIX } from "./inst.js";
 import {
-  spatialVoiceGains, analysisVoiceGains, voiceAzimuth, voicePanByte,
+  spatialVoiceGains, analysisVoiceGains, voiceAzimuth, voiceElevation, voicePanByte,
 } from "./spatial.js";
 import { applyTrackerRow, advanceRow } from "./row.js";
 import { TAP_PRE, TAP_POST } from "./loudness.js";
@@ -65,6 +65,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
       renderFmVoice(eng, ts, voice, interpMode, spt, ts.oplFrame + n)));
     out[0] = s;
     out[1] = s;
+    advanceFilterGlide(voice);
     return out;
   }
   // An OPL channel (item 209) replaces the sample fetch the same way, and
@@ -76,6 +77,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
       renderOplVoice(voice, ts.oplFrame + n)));
     out[0] = s;
     out[1] = s;
+    advanceFilterGlide(voice);
     return out;
   }
   // A PSG pair (§7.9) on the same chip clock. Unlike OPL it leaves the note
@@ -86,6 +88,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
       renderPsgVoice(voice, ts.oplFrame + n)));
     out[0] = s;
     out[1] = s;
+    advanceFilterGlide(voice);
     return out;
   }
   // A voice sounding a formant instrument (item 212) fetches its sample — or
@@ -97,6 +100,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
       renderFormantVoice(eng, voice, inst, interpMode, ts.oplFrame + n)));
     out[0] = s;
     out[1] = s;
+    advanceFilterGlide(voice);
     return out;
   }
   if (voice.activeChanCount !== 2) {
@@ -104,6 +108,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
       fetchTrackerSample(eng, voice, inst, interpMode)));
     out[0] = s;
     out[1] = s;
+    advanceFilterGlide(voice);
     return out;
   }
   fetchTrackerSampleStereo(eng, voice, inst, interpMode, out);
@@ -115,6 +120,7 @@ function renderVoicePair(eng, ts, voice, inst, interpMode, spt, out, n) {
   }
   out[0] = applyTaudVoiceFx(voice, applyVoiceFilter(voice, c0));
   out[1] = applyTaudVoiceFx(voice, applyVoiceFilter(voice, c1, voice.right), voice.right);
+  advanceFilterGlide(voice);
   return out;
 }
 
@@ -205,9 +211,15 @@ function extModClockLive(eng, voices, bgVoices) {
  * later frame: a tick that changes the tempo fires at the top of its frame,
  * but that frame was always rendered with the rate read before the tick.
  */
-function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRest, globalGain) {
+function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRest) {
   const scopeOn = ts.scopeOn;
-  if (!voice.active || voice.fader === 255) {
+  if (!voice.active || voice.faderCur !== voice.faderCur) {
+    // Nothing sounding (or nothing glided yet): the fader is simply where the
+    // host put it — there is no waveform for a jump to click in.
+    voice.faderCur = voice.fader; voice.faderAim = voice.fader; voice.faderLeft = 0;
+  }
+  // Muted, and the fader's glide down to silence has finished.
+  if (!voice.active || (voice.fader === 255 && voice.faderCur === 255)) {
     // A voice that is silent at the top of a span stays silent to its end:
     // only a tick or a host command can start one.
     if (scopeOn) { // keep the soundscope flat between notes / while muted
@@ -228,7 +240,7 @@ function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRe
   const voiceInst = eng.instruments[voice.instrumentId];
   const instGv = voiceInst.instGlobalVolume / 255.0;
   const swingScale = 1.0 + voice.randomVolBias / 255.0;
-  const faderGain = (255 - voice.fader) / 255.0;
+  const gainSpan = ts.gainSpan;
   // An instrument with a mixing chain (item 217) mixes into its own bus,
   // ahead of the song's global gain — which the bus's output gets instead.
   const route = ts.imixRoutes[(voice.displayInst || voice.instrumentId) & 0x3ff];
@@ -237,7 +249,9 @@ function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRe
   if (route !== null) route.fed = true;
 
   for (let n = n0; n < n1; n++) {
-    if (!voice.active) { // ramped out earlier in this span
+    // Ramped out earlier in this span, or muted and glided all the way down:
+    // a muted voice is FROZEN, not rendered silently, from that sample on.
+    if (!voice.active || (voice.fader === 255 && voice.faderCur === 255)) {
       if (scopeOn) {
         voice.scopeBuffer[voice.scopeWritePos] = 0;
         voice.scopeWritePos = (voice.scopeWritePos + 1) & (SCOPE_BUFFER_SIZE - 1);
@@ -266,9 +280,11 @@ function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRe
     // operator 0 of a rack, which reads it at unity and leaves the note's
     // volume to the finished patch, as for any rack (§5.5.1).
     const mixVol = voice.opl !== null && voice.fmRig === null ? 1.0 : voice.currentMixVolume;
-    const perVoiceGain = effEnvVol * voice.fadeoutVolume * mixVol *
+    const fade = advanceFadeout(voice);
+    const faderGain = (255 - advanceFaderRamp(voice, voice.fader)) / 255.0;
+    const perVoiceGain = effEnvVol * fade * mixVol *
       swingScale * instGv * faderGain * voice.layerMixGain * voice.activeAttenGain;
-    const vol = perVoiceGain * globalGain;
+    const vol = perVoiceGain * gainSpan[n];
     // ONE pan ramp, above the branch, because both paths smooth the same
     // composed number: every input to it moves once a TICK while the pan law
     // (and the ambisonic encode) is evaluated every sample, so without this
@@ -290,6 +306,7 @@ function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRe
       rGain = voice.panLawR;
     } else {
       advancePanRamp(voice, voiceAzimuth(voice), true);
+      advanceElevRamp(voice, voiceElevation(voice));
     }
     // Sample-end ramp-out.
     let rampGain;
@@ -352,7 +369,7 @@ function mixForegroundSpan(eng, ts, playhead, voice, vi, n0, n1, sptFirst, sptRe
  * voices have always had (their gain chain folds the globals in left to right,
  * so it is written out whole, not shared).
  */
-function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvol, mvol) {
+function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest) {
   // An FM operator is an OPERAND, not a sound: the rack that owns it read
   // it (and aged it) in the foreground pass, so summing it here would
   // put the modulators into the mix beside the note they shaped.
@@ -362,7 +379,11 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
   // own, so a lane mute/solo covers everything that came from it.
   const srcVoice = ts.voices[bg.sourceChannel];
   const bgFader = srcVoice && srcVoice.fader > bg.fader ? srcVoice.fader : bg.fader;
-  if (!bg.active || bgFader === 255) return;
+  if (!bg.active) return;
+  if (bg.faderCur !== bg.faderCur) { // a new voice starts AT the lane's fader
+    bg.faderCur = bgFader; bg.faderAim = bgFader; bg.faderLeft = 0;
+  }
+  if (bgFader === 255 && bg.faderCur === 255) return; // muted, glide finished
   const stems = eng.stemBus;
   const spatial = ts.spatial;
   const abus = ts.analysis === null ? null : ts.analysis.bus;
@@ -373,7 +394,9 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
   const bgInst = eng.instruments[bg.instrumentId];
   const instGv = bgInst.instGlobalVolume / 255.0;
   const swingScale = 1.0 + bg.randomVolBias / 255.0;
-  const faderGain = (255 - bgFader) / 255.0;
+  const gvolSpan = ts.gvolSpan;
+  const mvolSpan = ts.mvolSpan;
+  const masterSpan = ts.masterSpan;
   // A ghost and a layer child mix through the chain of the instrument the
   // NOTE named — a metainstrument's, not its layer's (item 217).
   const route = ts.imixRoutes[(bg.displayInst || bg.instrumentId) & 0x3ff];
@@ -382,7 +405,8 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
   if (route !== null) route.fed = true;
 
   for (let n = n0; n < n1; n++) {
-    if (!bg.active) continue; // ramped out earlier in this span
+    // Ramped out earlier in this span, or muted and glided down (frozen).
+    if (!bg.active || (bgFader === 255 && bg.faderCur === 255)) continue;
     const spt = n === n0 ? sptFirst : sptRest;
     // A metainstrument's layer children carry the sample-mod clock too
     // (item 154) — mirrors applyTrackerTick's own `if (bg.isLayerChild)`
@@ -395,10 +419,12 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
     const effEnvVol = bg.hasVolEnv && bg.volEnvOn ? bg.envVolMix : 1.0;
     advanceVolumeRamp(bg, volDiv);
     advancePitchRamp(bg, spt);
-    const vol = (effEnvVol * bg.fadeoutVolume *
+    const fade = advanceFadeout(bg);
+    const faderGain = (255 - advanceFaderRamp(bg, bgFader)) / 255.0;
+    const vol = (effEnvVol * fade *
       (bg.opl !== null && bg.fmRig === null ? 1.0 : bg.currentMixVolume) *
-      swingScale * gvol * mvol * instGv * faderGain * bg.layerMixGain * bg.activeAttenGain *
-      playhead.masterVolume) / 255.0;
+      swingScale * gvolSpan[n] * mvolSpan[n] * instGv * faderGain * bg.layerMixGain *
+      bg.activeAttenGain * masterSpan[n]) / 255.0;
     let lGain = 0.0;
     let rGain = 0.0;
     if (spatial === null) {
@@ -412,6 +438,7 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
       rGain = bg.panLawR;
     } else {
       advancePanRamp(bg, voiceAzimuth(bg), true);
+      advanceElevRamp(bg, voiceElevation(bg));
     }
     let rampGain;
     if (bg.rampOutSamples > 0) {
@@ -434,7 +461,7 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
     }
     if (busData !== null) {
       // The same chain without the three song-level gains the bus is ahead of.
-      const bvol = effEnvVol * bg.fadeoutVolume *
+      const bvol = effEnvVol * fade *
         (bg.opl !== null && bg.fmRig === null ? 1.0 : bg.currentMixVolume) *
         swingScale * instGv * faderGain * bg.layerMixGain * bg.activeAttenGain;
       if (busSpace === null) {
@@ -474,12 +501,17 @@ function mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvo
  * whose chain is idle and was not fed is skipped outright: its output is the
  * silence already in the buffer.
  */
-function runImixBuses(ts, playhead, buses, n0, n1, globalGain) {
+function runImixBuses(ts, playhead, buses, n0, n1) {
+  const gainSpan = ts.gainSpan;
   const spatial = ts.spatial;
-  const meter = ts.imixMeter;
-  // The tap meters the bus its instrument mixes into — in bus mode (item 247)
-  // the one every instrument on the block shares.
-  const meterBus = meter === null ? null : ts.imixRoutes[meter.slot];
+  // Each tap meters the bus its instrument mixes into — in bus mode (item 247)
+  // the one every instrument on the block shares. Two seats (one per split
+  // pane) may meter two buses, or both the same one.
+  const meters = ts.imixMeters;
+  const meterA = meters[0];
+  const meterB = meters[1];
+  const busA = meterA === null ? null : ts.imixRoutes[meterA.slot];
+  const busB = meterB === null ? null : ts.imixRoutes[meterB.slot];
   const trig = ts.imixTrig;
   for (let b = 0; b < buses.length; b++) {
     const bus = buses[b];
@@ -495,24 +527,33 @@ function runImixBuses(ts, playhead, buses, n0, n1, globalGain) {
       chain.process(bus.data, TRACKER_CHUNK, n0, n1, playhead.bpm, false);
       continue;
     }
-    const metered = meterBus === bus;
-    if (metered) { meter.pushPre(bus, n0, n1); chain.probe = meter; }
+    const a = busA === bus ? meterA : null;
+    const b2 = busB === bus ? meterB : null;
+    if (a !== null) a.pushPre(bus, n0, n1);
+    if (b2 !== null) b2.pushPre(bus, n0, n1);
+    if (a !== null && b2 !== null) {
+      const fan = ts.imixFan;
+      fan.a = a; fan.b = b2;
+      chain.probe = fan;
+    } else chain.probe = a ?? b2;
     chain.process(bus.data, TRACKER_CHUNK, n0, n1, playhead.bpm, bus.fed);
-    if (metered) { chain.probe = null; meter.pushPost(bus, n0, n1); }
+    chain.probe = null;
+    if (a !== null) a.pushPost(bus, n0, n1);
+    if (b2 !== null) b2.pushPost(bus, n0, n1);
     const d = bus.data;
     if (spatial === null) {
       const accL = ts.mixAccL;
       const accR = ts.mixAccR;
       for (let n = n0; n < n1; n++) {
-        accL[n] += d[n] * globalGain;
-        accR[n] += d[TRACKER_CHUNK + n] * globalGain;
+        accL[n] += d[n] * gainSpan[n];
+        accR[n] += d[TRACKER_CHUNK + n] * gainSpan[n];
       }
     } else {
       const sd = spatial.data;
       const nch = bus.nch;
       for (let c = 0; c < nch; c++) {
         const o = c * TRACKER_CHUNK;
-        for (let n = n0; n < n1; n++) sd[o + n] += d[o + n] * globalGain;
+        for (let n = n0; n < n1; n++) sd[o + n] += d[o + n] * gainSpan[n];
       }
     }
   }
@@ -626,10 +667,18 @@ export function generateTrackerAudio(eng, playhead, out) {
       n1++;
     }
 
-    const gvol = playhead.globalVolume / 255.0;
-    const mvol = playhead.mixingVolume / 255.0;
-    // Every voice is scaled by it, and nothing inside a span can change it.
-    const globalGain = (gvol * mvol * playhead.masterVolume) / 255.0;
+    // The song-level gains, per frame: a tick or the host can move them only
+    // between spans, and each glides to its new value over 2 ms (ByteGlide) —
+    // stepping them clicked on every V and stair-stepped every W slide. Held
+    // still, they are the very numbers the chain always used.
+    const gvolSpan = ts.gvolSpan;
+    const mvolSpan = ts.mvolSpan;
+    const masterSpan = ts.masterSpan;
+    const gainSpan = ts.gainSpan;
+    ts.gvolGlide.fill(playhead.globalVolume, gvolSpan, n0, n1, 255.0);
+    ts.mvolGlide.fill(playhead.mixingVolume, mvolSpan, n0, n1, 255.0);
+    ts.masterGlide.fill(playhead.masterVolume, masterSpan, n0, n1, 1.0);
+    for (let n = n0; n < n1; n++) gainSpan[n] = (gvolSpan[n] * mvolSpan[n] * masterSpan[n]) / 255.0;
 
     if (spatial === null) {
       accL.fill(0.0, n0, n1);
@@ -638,27 +687,27 @@ export function generateTrackerAudio(eng, playhead, out) {
     for (let b = 0; b < nBuses; b++) buses[b].clear(n0, n1);
     if (!extModClockLive(eng, voices, bgVoices)) {
       for (let vi = 0; vi < nVoices; vi++) {
-        mixForegroundSpan(eng, ts, playhead, voices[vi], vi, n0, n1, sptFirst, sptRest, globalGain);
+        mixForegroundSpan(eng, ts, playhead, voices[vi], vi, n0, n1, sptFirst, sptRest);
       }
       // Background (NNA-ghost + metainstrument layer-child) voices.
       for (const bg of bgVoices) {
-        mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest, gvol, mvol);
+        mixBackgroundSpan(eng, ts, playhead, bg, n0, n1, sptFirst, sptRest);
       }
     } else {
       for (let n = n0; n < n1; n++) {
         const spt = n === n0 ? sptFirst : sptRest;
         for (let vi = 0; vi < nVoices; vi++) {
-          mixForegroundSpan(eng, ts, playhead, voices[vi], vi, n, n + 1, spt, spt, globalGain);
+          mixForegroundSpan(eng, ts, playhead, voices[vi], vi, n, n + 1, spt, spt);
         }
         for (const bg of bgVoices) {
-          mixBackgroundSpan(eng, ts, playhead, bg, n, n + 1, spt, spt, gvol, mvol);
+          mixBackgroundSpan(eng, ts, playhead, bg, n, n + 1, spt, spt);
         }
       }
     }
 
     // Every instrument bus runs its chain over the span and joins the mix,
     // scaled by the song's global gain, in ascending slot order.
-    if (nBuses > 0) runImixBuses(ts, playhead, buses, n0, n1, globalGain);
+    if (nBuses > 0) runImixBuses(ts, playhead, buses, n0, n1);
 
     for (let n = n0; n < n1; n++) {
       let mixL;

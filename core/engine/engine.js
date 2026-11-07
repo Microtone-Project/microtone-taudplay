@@ -533,8 +533,9 @@ export class TaudEngine {
   }
   getImix() { return [...this.imixBlocks.values()]; }
 
-  /** Install (or drop, slot < 0) the Mixing tab's tap on one instrument's bus. */
-  setImixMeter(ph, slot) { this.playheads[ph].trackerState.setImixMeter(slot); }
+  /** Install (or drop, slot < 0) the Mixing tab's tap on one instrument's bus,
+   *  in `seat` (one per split pane, < IMX_METER_SEATS). */
+  setImixMeter(ph, slot, seat = 0) { this.playheads[ph].trackerState.setImixMeter(slot, seat); }
 
   /**
    * Install (or drop) the Mastering view's metering tap (loudness.js). Like the
@@ -776,7 +777,7 @@ export class TaudEngine {
     if (!v.active) return 0.0;
     const effEnvVol = v.hasVolEnv && v.volEnvOn ? v.envVolMix : 1.0;
     const faderGain = (255 - v.fader) / 255.0;
-    return Math.min(Math.max(effEnvVol * v.fadeoutVolume * v.currentMixVolume * faderGain, 0.0), 1.0);
+    return Math.min(Math.max(effEnvVol * v.fadeoutMix * v.currentMixVolume * faderGain, 0.0), 1.0);
   }
 
   /** Pan as the stereo meters want it: a surround voice reports where the

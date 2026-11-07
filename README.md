@@ -200,7 +200,7 @@ The vendored decompressors keep their own (MIT) licences:
 
 ---
 
-Generated from Microtone.js 4.7.4 (engine e583deb19b9a) by
+Generated from Microtone.js 4.8.1 (engine af37ee7d12dc) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.

@@ -7,12 +7,12 @@ import {
   NUM_INTERRUPTS,
 } from "./constants.js";
 import { Voice } from "./voice.js";
-import { startCutRamp } from "./sampler.js";
+import { startCutRamp, ByteGlide } from "./sampler.js";
 import { SURROUND_STEREO, SURROUND_SPATIAL, SpatialBus, StereoRenderer } from "./spatial.js";
 import { MONITOR_FOLD, MONITOR_BINAURAL, BinauralRenderer } from "./binaural.js";
 import { ANALYSIS_OFF, AnalysisTap } from "./analysis.js";
 import { MasterChain, defaultMastering, masteringEngaged } from "./mastering.js";
-import { IMX_ROUTE_SLOTS, ImixMeterTap } from "./imix.js";
+import { IMX_ROUTE_SLOTS, IMX_METER_SEATS, ImixMeterTap, ImixProbeFan } from "./imix.js";
 import {
   MasterMeterTap, DEFAULT_BIT_DEPTH,
   HIST_SPAN_ALL, HIST_SPAN_LONG, HIST_SPAN_SHORT,
@@ -267,14 +267,17 @@ export class TrackerState {
     // whenever the engine's blocks or instrument records change (imixGen) or
     // the song's channel layout does. `imixTrig` flags the slots a note
     // started on since their bus last ran — the LFOs that retrigger on a note
-    // read it. `imixMeter` is the Mixing tab's tap, null unless it asked.
+    // read it. `imixMeters` are the Mixing tab's taps, one seat per split
+    // pane, each null unless that pane asked; `imixFan` is the probe that
+    // feeds two of them when they meter one shared bus.
     this.imixGen = -1;
     this.imixRate = 0;
     this.imixBuses = new Map();
     this.imixRoutes = new Array(IMX_ROUTE_SLOTS).fill(null);
     this.imixList = [];
     this.imixTrig = new Uint8Array(IMX_ROUTE_SLOTS);
-    this.imixMeter = null;
+    this.imixMeters = new Array(IMX_METER_SEATS).fill(null);
+    this.imixFan = new ImixProbeFan();
     // Per-voice soundscope ring, ditto (item 179). The Kotlin device fills
     // `Voice.scopeBuffer` unconditionally because a TSVM guest can read the
     // scope window through MMIO whenever it likes; nothing here can, so the
@@ -329,6 +332,17 @@ export class TrackerState {
     // voice that started it.
     this.mixAccL = new Float64Array(TRACKER_CHUNK);
     this.mixAccR = new Float64Array(TRACKER_CHUNK);
+    // The song's global volume, the mixing volume and the master volume as the
+    // mixer glides them (sampler.js ByteGlide), and their per-frame values for
+    // the span being mixed: the first two as fractions, the master as a byte,
+    // `gainSpan` the three combined — exactly the factors the gain chain uses.
+    this.gvolGlide = new ByteGlide();
+    this.mvolGlide = new ByteGlide();
+    this.masterGlide = new ByteGlide();
+    this.gvolSpan = new Float64Array(TRACKER_CHUNK);
+    this.mvolSpan = new Float64Array(TRACKER_CHUNK);
+    this.masterSpan = new Float64Array(TRACKER_CHUNK);
+    this.gainSpan = new Float64Array(TRACKER_CHUNK);
 
     // Mixer-private background voices (NNA ghosts); index 0 = oldest.
     this.backgroundVoices = [];
@@ -421,10 +435,12 @@ export class TrackerState {
   }
 
   /** Install (or drop, with a negative slot) the Mixing tab's tap on one
-   *  instrument's bus (item 217). */
-  setImixMeter(slot) {
-    if (slot < 0) { this.imixMeter = null; return; }
-    if (this.imixMeter === null || this.imixMeter.slot !== slot) this.imixMeter = new ImixMeterTap(slot);
+   *  instrument's bus (item 217), in `seat` (one per split pane). */
+  setImixMeter(slot, seat = 0) {
+    if (!(seat >= 0 && seat < IMX_METER_SEATS)) return;
+    const m = this.imixMeters;
+    if (slot < 0) { m[seat] = null; return; }
+    if (m[seat] === null || m[seat].slot !== slot) m[seat] = new ImixMeterTap(slot);
   }
 
   drainInterrupts() {
@@ -462,7 +478,11 @@ export class TrackerState {
     this.finePatternDelayExtra = 0;
     this.pendingInterrupts = 0;
     this.interruptArgs.fill(0);
-    for (const v of this.voices) v.active = false;
+    // A play starts AT its levels: nothing glides in from the last one.
+    for (const v of this.voices) { v.active = false; v.faderCur = NaN; }
+    this.gvolGlide.cur = NaN;
+    this.mvolGlide.cur = NaN;
+    this.masterGlide.cur = NaN;
     this.backgroundVoices.length = 0; // drop lingering NNA ghosts from a prior play
     // The mastering chain (item 178) is per-PLAY transient in exactly the sense
     // the ghost pool is: a compressor still holding six decibels of reduction
@@ -477,7 +497,7 @@ export class TrackerState {
     // …and the meter's integration describes one playback, so it starts again
     // with it — including the bit histogram, which is cumulative by design.
     this.masterMeter?.resetAll();
-    this.imixMeter?.resetAll();
+    for (const m of this.imixMeters) m?.resetAll();
   }
 }
 
@@ -741,6 +761,7 @@ export class Playhead {
       it.modWritePos = 0;
       it.modXfade = 0;
       it.fader = 0;
+      it.faderCur = NaN;
       it.nnaOverride = -1;
       it.volEnvOn = true; it.panEnvOn = true; it.pitchEnvOn = true; it.filterEnvOn = true;
       it.metaForeground = false;
@@ -771,7 +792,7 @@ export class Playhead {
       it.envPitchIndex = 0; it.envPitchTimeSec = 0.0; it.envPitchValue = 0.5;
       it.envFilterIndex = 0; it.envFilterTimeSec = 0.0; it.envFilterValue = 0.5;
       it.hasPitchEnv = false; it.hasFilterEnv = false;
-      it.fadeoutVolume = 1.0;
+      it.fadeoutVolume = 1.0; it.fadeoutMix = 1.0; it.fadeoutMixStep = 0.0;
       it.rampOutSamples = 0; it.rampOutGain = 0.0; it.rampOutStep = 0.0;
       it.attackRampSamples = 0;
       it.noteVal = 0x0000; it.basePitch = 0x4000;
@@ -779,6 +800,7 @@ export class Playhead {
       it.tonePortaTarget = -1; it.tonePortaSpeed = 0;
       it.filterY1 = 0.0; it.filterY2 = 0.0; it.filterX1 = 0.0; it.filterX2 = 0.0;
       it.filterCutoffCached = -1; it.filterResonanceCached = -1;
+      it.sfCents = NaN; it.sfCentsLeft = 0; it.sfQLeft = 0;
       it.currentCutoff = 0xff; it.currentResonance = 0xff;
       it.nesDpcmCounter = 63;
       it.right.reset();
