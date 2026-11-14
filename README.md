@@ -170,6 +170,17 @@ made. This library only plays them.
 Songs are made with **Microtone** — a tracker for the notes a piano cannot
 play, free and in your browser at [microtone.cc](https://microtone.cc).
 
+## The engine inside
+
+The engine is Microtone's own, written in C (`core/engine/c/`) and compiled
+to WebAssembly. The compiled module rides, base64'd, in
+`core/engine/taud-engine.wasm.js` — an ES module like every other file here —
+so there is still no build step, nothing to fetch and nothing to configure: it
+loads wherever the library does, an AudioWorklet included, and renders the same
+bits on every machine. The source it was built from is beside it;
+`node tools/make-engine-wasm.js` rebuilds it (clang with the wasm32 target, a
+matching wasm-ld, and wasi-libc).
+
 ## Format support
 
 Full `.taud` files, any format version the engine reads, 32- or 64-lane,
@@ -196,11 +207,11 @@ where it is authored; this repository is generated from there.
 The vendored decompressors keep their own (MIT) licences:
 [fflate](https://github.com/101arrowz/fflate) and
 [fzstd](https://github.com/101arrowz/fzstd). The binaural filter set in
-`core/engine/hrir-sadie.js` is the GoogleVR/SADIE set, Apache-2.0.
+`core/engine/c/src/hrir_sadie.c` is the GoogleVR/SADIE set, Apache-2.0.
 
 ---
 
-Generated from Microtone.js 4.10.0 (engine 25b432cfdc38) by
+Generated from Microtone.js 5.0.0 (engine 00dd4b201880) by
 `tools/make-taudplay.js`. Do not edit the engine here — edit it there and
 regenerate, or the library and the tracker stop agreeing about what a song
 sounds like.

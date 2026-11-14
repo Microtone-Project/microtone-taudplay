@@ -22,7 +22,7 @@
 // per-render parameter.
 export let SAMPLING_RATE = 48000;
 // Batch length of the mixer's per-sample loop. Tick/row timing is per-SAMPLE
-// (mixer.js `samplesIntoTick`), so this is pure batching granularity and does
+// (mixer.c `samplesIntoTick`), so this is pure batching granularity and does
 // NOT affect output — verified bit-exact vs the 512 baseline on the whole
 // deterministic corpus. DELIBERATE web divergence from Kotlin's 512: the
 // AudioWorklet must finish each render inside one ~2.67 ms quantum, and a 512-
@@ -77,6 +77,10 @@ const RAMP_OUT_SEC = 0.008;
 // GEN_VOLENVRELEASE = -2000 timecents.
 export const FAST_FADE_SEC = 0.3;
 
+/** The longest crossfade over a funk-repeat seam (S $Fx, the walking loop),
+ *  in output samples; a grain shorter than this is its own cap. */
+export const FUNK_XFADE_SAMPLES = 64;
+
 // Volume-change anti-click ramp: 2 ms (64 samples at Kotlin's 32 kHz).
 // Bypassed on fresh note triggers.
 export let VOL_RAMP_SAMPLES = 96;
@@ -106,7 +110,7 @@ const SF_FILTER_GLIDE_SEC = 64 / 44100;
 // portamento arriving is meant to be at its new pitch NOW, and a tick-long bend
 // across it is heard as a bend. So the glide's budget is (interval × time), not
 // time: a move this wide is given the whole tick, and anything wider gets
-// proportionally less of one (sampler.js pitchGlideSamples), never below the
+// proportionally less of one (sampler.c pitchGlideSamples), never below the
 // attack ramp's ~⅔ ms. The figure is 25 cents — an eighth of a 12-TET semitone,
 // wider than any vibrato or slide moves between ticks, narrower than the
 // smallest interval a listener would call a note change.
@@ -213,3 +217,10 @@ export const NOTE_FAST_FADE = 0x0004;
 export const NOTE_INT_FIRST = 0x0010; // Int0..IntF interrupt notes
 export const NOTE_INT_LAST = 0x001f;
 export const NUM_INTERRUPTS = 16;
+
+// Monitor modes (a device setting on the playhead, not a song property): the
+// fold onto the stereo pan law, the default, or the binaural head — the
+// surround song decoded to two ears through the SADIE HRIR set
+// (core/engine/c/src/binaural.c; engine spec "Binaural monitoring").
+export const MONITOR_FOLD = 0;
+export const MONITOR_BINAURAL = 1;
