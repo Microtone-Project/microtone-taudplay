@@ -23,7 +23,8 @@
     "audio",
     "webaudio",
     "chiptune",
-    "module"
+    "module",
+    "wasm"
   ],
   "repository": {
     "type": "git",
